@@ -1,0 +1,12 @@
+[package]
+name = "shroud-oracle-commitment"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+shroud-core = { path = "../shroud-core" }
+
+[lib]
+path = "src/lib.rs"

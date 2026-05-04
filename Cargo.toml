@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/shroud-core",
+    "crates/shroud-adapter",
+    "crates/shroud-batch-opening",
+    "crates/shroud-codeword-embedding",
+    "crates/shroud-opening-projection",
+    "crates/shroud-oracle-commitment",
+    "crates/shroud-quotient-hider",
+    "crates/shroud-reference",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/latifkasuli/shroud"
+rust-version = "1.85"
+version = "0.1.0"

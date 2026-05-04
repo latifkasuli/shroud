@@ -1,0 +1,2505 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+//! Toy transcript/model layer for concrete SHROUD objects and adapter mappings.
+
+use core::fmt;
+
+use shroud_adapter::{
+    BatchOpeningAdapter, BatchOpeningAdapterPlan, OpeningProjectionAdapter,
+    OpeningProjectionAdapterPlan, OracleCommitmentAdapter, OracleCommitmentAdapterPlan,
+    QuotientHiderAdapter, QuotientHiderAdapterPlan, proof_slot_layout,
+};
+use shroud_batch_opening::{
+    BatchOpeningShape, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
+    PerfectRandomizerAdapter, PerfectRandomizerAdapterSurface, PerfectRandomizerBackend,
+    PerfectRandomizerCommitment, PerfectRandomizerOpening, PerfectRandomizerReconstruction,
+    PerfectRandomizerTranscript, PreparedPerfectRandomizer, ProofSlotLayout,
+    RandomizerOpeningPayload, ShroudBatchOpeningSpec,
+};
+use shroud_core::TranscriptStage;
+use shroud_opening_projection::{AuxiliaryOpeningTransport, ShroudOpeningProjectionSpec};
+use shroud_oracle_commitment::{OracleAuxiliaryTransport, ShroudOracleCommitmentSpec};
+use shroud_quotient_hider::{QuotientAuxiliaryTransport, ShroudQuotientHiderSpec};
+
+/// Reference transcript state machine for the SHROUD batch-opening schedule.
+#[derive(Debug)]
+pub struct ReferenceTranscript<'a> {
+    spec: &'a ShroudBatchOpeningSpec,
+    cursor: usize,
+}
+
+impl<'a> ReferenceTranscript<'a> {
+    /// Creates a transcript at the first stage of the supplied spec.
+    #[must_use]
+    pub fn new(spec: &'a ShroudBatchOpeningSpec) -> Self {
+        Self { spec, cursor: 0 }
+    }
+
+    /// Returns the next stage expected by the transcript, if any.
+    #[must_use]
+    pub fn expected_stage(&self) -> Option<TranscriptStage> {
+        self.spec
+            .transcript_plan()
+            .stages()
+            .get(self.cursor)
+            .copied()
+    }
+
+    /// Advances the transcript by one stage.
+    pub fn advance(&mut self, stage: TranscriptStage) -> Result<(), ReferenceTranscriptError> {
+        match self.expected_stage() {
+            Some(expected) if expected == stage => {
+                self.cursor += 1;
+                Ok(())
+            }
+            Some(expected) => Err(ReferenceTranscriptError::UnexpectedStage {
+                expected,
+                observed: stage,
+            }),
+            None => Err(ReferenceTranscriptError::AlreadyComplete),
+        }
+    }
+
+    /// Returns `true` when the transcript has consumed the full plan.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.cursor == self.spec.transcript_plan().stages().len()
+    }
+}
+
+/// Error raised when the reference transcript violates the planned stage order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceTranscriptError {
+    /// The transcript observed a stage other than the one required next.
+    UnexpectedStage {
+        /// Stage required by the plan.
+        expected: TranscriptStage,
+        /// Stage supplied by the caller.
+        observed: TranscriptStage,
+    },
+    /// The transcript was advanced after it had already consumed every stage.
+    AlreadyComplete,
+}
+
+impl fmt::Display for ReferenceTranscriptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedStage { expected, observed } => {
+                write!(
+                    f,
+                    "expected transcript stage {expected}, observed {observed}"
+                )
+            }
+            Self::AlreadyComplete => write!(f, "transcript is already complete"),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceTranscriptError {}
+
+impl PerfectRandomizerTranscript for ReferenceTranscript<'_> {
+    type Error = ReferenceTranscriptError;
+
+    fn observe_perfect_randomizer_commitment<Commitment>(
+        &mut self,
+        _commitment: &Commitment,
+    ) -> Result<(), Self::Error> {
+        self.advance(TranscriptStage::ObserveRandomizerCommitment)
+    }
+}
+
+/// Reference commitment object for a perfect randomizer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferencePerfectRandomizerCommitment {
+    model: PerfectRandomizerCommitment,
+    shape: BatchOpeningShape,
+}
+
+impl ReferencePerfectRandomizerCommitment {
+    /// Returns the commitment model used by this reference commitment.
+    #[must_use]
+    pub const fn model(self) -> PerfectRandomizerCommitment {
+        self.model
+    }
+
+    /// Returns the batch-opening shape this commitment was prepared for.
+    #[must_use]
+    pub const fn shape(self) -> BatchOpeningShape {
+        self.shape
+    }
+}
+
+/// Reference prover-side state for a perfect randomizer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferencePerfectRandomizerState {
+    shape: BatchOpeningShape,
+}
+
+impl ReferencePerfectRandomizerState {
+    /// Returns the batch-opening shape retained by the prover.
+    #[must_use]
+    pub const fn shape(self) -> BatchOpeningShape {
+        self.shape
+    }
+}
+
+/// Public extension-field evaluation exposed by the reference backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferencePublicEvaluation {
+    point_index: usize,
+}
+
+impl ReferencePublicEvaluation {
+    /// Returns the opening-point index for this public evaluation.
+    #[must_use]
+    pub const fn point_index(self) -> usize {
+        self.point_index
+    }
+}
+
+/// Hidden opening object emitted by the reference backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceHiddenOpening {
+    evaluation_count: usize,
+    transport: HiddenOpeningTransport,
+}
+
+impl ReferenceHiddenOpening {
+    /// Returns the number of hidden evaluations carried by the proof.
+    #[must_use]
+    pub const fn evaluation_count(self) -> usize {
+        self.evaluation_count
+    }
+
+    /// Returns how the hidden opening is transported.
+    #[must_use]
+    pub const fn transport(self) -> HiddenOpeningTransport {
+        self.transport
+    }
+}
+
+/// Reference backend for the perfect batch-opening randomizer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferencePerfectRandomizerBackend {
+    model: PerfectRandomizerCommitment,
+}
+
+impl ReferencePerfectRandomizerBackend {
+    /// Builds the SHROUD v1 preferred backend model using an encoded oracle bundle.
+    #[must_use]
+    pub const fn encoded_oracle_bundle() -> Self {
+        Self {
+            model: PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        }
+    }
+
+    /// Builds the native extension-field PCS backend model.
+    #[must_use]
+    pub const fn native_extension_pcs() -> Self {
+        Self {
+            model: PerfectRandomizerCommitment::native_extension_pcs(),
+        }
+    }
+}
+
+/// Error raised by the reference perfect-randomizer backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePerfectRandomizerError {
+    /// The supplied batch-opening spec is not a perfect variant.
+    ExpectedPerfectVariant,
+    /// The backend model does not match the one requested by the spec.
+    CommitmentModelMismatch {
+        /// Model expected by the backend or spec.
+        expected: PerfectRandomizerCommitment,
+        /// Model actually supplied.
+        observed: PerfectRandomizerCommitment,
+    },
+    /// The opening exposed the wrong number of public evaluations.
+    PublicEvaluationCountMismatch {
+        /// Number expected by the payload model.
+        expected: usize,
+        /// Number present in the opening.
+        observed: usize,
+    },
+    /// The hidden opening payload does not match the spec.
+    HiddenOpeningMismatch {
+        /// Number of hidden evaluations expected.
+        expected_evaluations: usize,
+        /// Number actually provided.
+        observed_evaluations: usize,
+        /// Transport expected by the payload model.
+        expected_transport: HiddenOpeningTransport,
+        /// Transport actually supplied.
+        observed_transport: HiddenOpeningTransport,
+    },
+}
+
+impl fmt::Display for ReferencePerfectRandomizerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExpectedPerfectVariant => write!(
+                f,
+                "perfect randomizer backend requires a perfect batch-opening spec"
+            ),
+            Self::CommitmentModelMismatch { expected, observed } => write!(
+                f,
+                "perfect randomizer commitment model mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicEvaluationCountMismatch { expected, observed } => write!(
+                f,
+                "public evaluation count mismatch: expected {expected}, observed {observed}"
+            ),
+            Self::HiddenOpeningMismatch {
+                expected_evaluations,
+                observed_evaluations,
+                expected_transport,
+                observed_transport,
+            } => write!(
+                f,
+                "hidden opening mismatch: expected {expected_evaluations} evaluations over {expected_transport:?}, observed {observed_evaluations} evaluations over {observed_transport:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferencePerfectRandomizerError {}
+
+/// Plonky3-like commitment slots for the perfect-randomizer adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3CommitmentSlot {
+    /// Reuse the existing `random: Option<Com>` slot.
+    RandomOptionField,
+    /// Introduce a dedicated top-level commitment slot for the perfect randomizer.
+    DedicatedPerfectRandomizerField,
+}
+
+/// Adapter that maps the perfect-randomizer object onto a Plonky3-like proof shape.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferencePlonky3Adapter;
+
+/// Plonky3-like slot carrying the public opening view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3PublicOpeningSlot {
+    /// Reuse the outer `opened_values` field.
+    OpenedValuesField,
+}
+
+/// Plonky3-like slot carrying hidden auxiliary opening material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3HiddenAuxiliarySlot {
+    /// Keep hidden auxiliaries inside the internal FRI opening proof object.
+    FriOpeningProofInternals,
+    /// Carry hidden auxiliaries in a dedicated outer field.
+    DedicatedProjectionField,
+}
+
+/// Plonky3-like slot carrying a hidden oracle commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3OracleCommitmentSlot {
+    /// Reuse the outer field that stores committed oracle objects.
+    OracleCommitmentField,
+}
+
+/// Plonky3-like slot carrying public MMCS opening material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3OracleOpeningSlot {
+    /// Reuse the internal MMCS opening proof object.
+    MmcsOpeningProof,
+}
+
+/// Plonky3-like slot carrying hidden oracle witness material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3OracleHiddenAuxiliarySlot {
+    /// Keep hidden row-hiding witnesses inside the internal MMCS proof object.
+    HidingMmcsInternals,
+    /// Carry hidden row-hiding witnesses in a dedicated outer field.
+    DedicatedOracleWitnessField,
+}
+
+/// Plonky3-like slot carrying a hidden quotient commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3QuotientCommitmentSlot {
+    /// Reuse the outer field that stores quotient commitments.
+    QuotientCommitmentField,
+}
+
+/// Plonky3-like slot carrying public quotient opening material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3QuotientOpeningSlot {
+    /// Reuse the outer field that stores opened quotient values.
+    OpenedQuotientValuesField,
+}
+
+/// Plonky3-like slot carrying hidden quotient witness material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3QuotientHiddenAuxiliarySlot {
+    /// Keep hidden quotient auxiliaries inside the internal opening proof object.
+    FriOpeningProofInternals,
+    /// Carry hidden quotient auxiliaries in a dedicated outer field.
+    DedicatedQuotientWitnessField,
+}
+
+/// Logical proof carriers for a backend that uses explicit proof envelopes instead of fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredCommitmentCarrier {
+    /// The randomizer travels inside the main batch-opening proof object.
+    SharedBatchOpeningEnvelope,
+    /// The randomizer travels in an auxiliary proof envelope shared with existing hiding material.
+    AuxiliaryRandomizerEnvelope,
+    /// The perfect randomizer gets its own dedicated proof envelope.
+    DedicatedPerfectRandomizerEnvelope,
+}
+
+/// Adapter that maps SHROUD onto a layered proof format with explicit auxiliary envelopes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferenceLayeredAdapter;
+
+/// Public carrier for the layered reference adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredPublicOpeningCarrier {
+    /// Public openings travel in the statement-visible opening envelope.
+    StatementOpeningEnvelope,
+}
+
+/// Hidden carrier for the layered reference adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredHiddenAuxiliaryCarrier {
+    /// Hidden auxiliaries stay inside the main opening-proof envelope.
+    MainOpeningProofEnvelope,
+    /// Hidden auxiliaries travel in a separate projection envelope.
+    ProjectionAuxiliaryEnvelope,
+}
+
+/// Logical commitment carriers for a layered oracle-commitment mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredOracleCommitmentCarrier {
+    /// The hidden oracle commitment travels in the public oracle-commitment envelope.
+    OracleCommitmentEnvelope,
+}
+
+/// Public carrier for layered oracle openings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredOracleOpeningCarrier {
+    /// Public row values and authentication data travel in the oracle-opening envelope.
+    OracleOpeningEnvelope,
+}
+
+/// Hidden carrier for layered oracle witness material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredOracleHiddenAuxiliaryCarrier {
+    /// Hidden witnesses stay in-band with the main oracle-opening envelope.
+    OracleOpeningEnvelope,
+    /// Hidden witnesses move into a dedicated auxiliary oracle envelope.
+    OracleAuxiliaryWitnessEnvelope,
+}
+
+/// Logical commitment carriers for a layered quotient-hider mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredQuotientCommitmentCarrier {
+    /// The quotient commitment travels in the public quotient-commitment envelope.
+    QuotientCommitmentEnvelope,
+}
+
+/// Public carrier for layered quotient openings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredQuotientOpeningCarrier {
+    /// Public quotient openings travel in the quotient-opening envelope.
+    QuotientOpeningEnvelope,
+}
+
+/// Hidden carrier for layered quotient auxiliary material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredQuotientHiddenAuxiliaryCarrier {
+    /// Hidden quotient auxiliaries stay in-band with the quotient-opening envelope.
+    QuotientOpeningEnvelope,
+    /// Hidden quotient auxiliaries move into a dedicated auxiliary quotient envelope.
+    QuotientAuxiliaryEnvelope,
+}
+
+/// Error raised by the reference adapter surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceAdapterError {
+    /// The supplied batch-opening spec is not a perfect variant.
+    ExpectedPerfectVariant,
+    /// The supplied outer proof-layout plan does not match the SHROUD spec.
+    PlanMismatch,
+    /// The provided commitment slot does not match the layout implied by the spec.
+    CommitmentSlotMismatch {
+        /// Slot required by the adapter surface.
+        expected: ReferencePlonky3CommitmentSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3CommitmentSlot,
+    },
+}
+
+impl fmt::Display for ReferenceAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExpectedPerfectVariant => {
+                write!(f, "adapter requires a perfect batch-opening spec")
+            }
+            Self::PlanMismatch => write!(f, "adapter plan does not match the SHROUD spec"),
+            Self::CommitmentSlotMismatch { expected, observed } => write!(
+                f,
+                "adapter commitment slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceAdapterError {}
+
+/// Error raised by the Plonky3-like opening-projection adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceProjectionAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD projection spec.
+    PlanMismatch,
+    /// The public opening slot does not match the expected outer layout.
+    PublicOpeningSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3PublicOpeningSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3PublicOpeningSlot,
+    },
+    /// The hidden auxiliary slot does not match the expected outer layout.
+    HiddenAuxiliarySlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3HiddenAuxiliarySlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3HiddenAuxiliarySlot,
+    },
+}
+
+impl fmt::Display for ReferenceProjectionAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => {
+                write!(
+                    f,
+                    "opening-projection adapter plan does not match the SHROUD spec"
+                )
+            }
+            Self::PublicOpeningSlotMismatch { expected, observed } => write!(
+                f,
+                "public opening slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenAuxiliarySlotMismatch { expected, observed } => write!(
+                f,
+                "hidden auxiliary slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceProjectionAdapterError {}
+
+/// Error raised by the Plonky3-like oracle-commitment adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceOracleCommitmentAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD oracle-commitment spec.
+    PlanMismatch,
+    /// The public commitment slot does not match the expected outer layout.
+    CommitmentSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3OracleCommitmentSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3OracleCommitmentSlot,
+    },
+    /// The public opening slot does not match the expected outer layout.
+    PublicOpeningSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3OracleOpeningSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3OracleOpeningSlot,
+    },
+    /// The hidden auxiliary slot does not match the expected outer layout.
+    HiddenAuxiliarySlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3OracleHiddenAuxiliarySlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3OracleHiddenAuxiliarySlot,
+    },
+}
+
+impl fmt::Display for ReferenceOracleCommitmentAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "oracle-commitment adapter plan does not match the SHROUD spec"
+            ),
+            Self::CommitmentSlotMismatch { expected, observed } => write!(
+                f,
+                "oracle commitment slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicOpeningSlotMismatch { expected, observed } => write!(
+                f,
+                "oracle public opening slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenAuxiliarySlotMismatch { expected, observed } => write!(
+                f,
+                "oracle hidden auxiliary slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceOracleCommitmentAdapterError {}
+
+/// Error raised by the Plonky3-like quotient-hider adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceQuotientHiderAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD quotient-hider spec.
+    PlanMismatch,
+    /// The public commitment slot does not match the expected outer layout.
+    CommitmentSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3QuotientCommitmentSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3QuotientCommitmentSlot,
+    },
+    /// The public opening slot does not match the expected outer layout.
+    PublicOpeningSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3QuotientOpeningSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3QuotientOpeningSlot,
+    },
+    /// The hidden auxiliary slot does not match the expected outer layout.
+    HiddenAuxiliarySlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3QuotientHiddenAuxiliarySlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3QuotientHiddenAuxiliarySlot,
+    },
+}
+
+impl fmt::Display for ReferenceQuotientHiderAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "quotient-hider adapter plan does not match the SHROUD spec"
+            ),
+            Self::CommitmentSlotMismatch { expected, observed } => write!(
+                f,
+                "quotient commitment slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicOpeningSlotMismatch { expected, observed } => write!(
+                f,
+                "quotient public opening slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenAuxiliarySlotMismatch { expected, observed } => write!(
+                f,
+                "quotient hidden auxiliary slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceQuotientHiderAdapterError {}
+
+/// Error raised by the layered reference adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD spec.
+    PlanMismatch,
+    /// The provided proof carrier does not match the layout implied by the spec.
+    CommitmentCarrierMismatch {
+        /// Carrier required by the adapter surface.
+        expected: ReferenceLayeredCommitmentCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredCommitmentCarrier,
+    },
+}
+
+impl fmt::Display for ReferenceLayeredAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(f, "layered adapter plan does not match the SHROUD spec"),
+            Self::CommitmentCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered adapter carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceLayeredAdapterError {}
+
+fn layered_carrier_for_plan(
+    commitment_boundary: shroud_batch_opening::CommitmentBoundary,
+    proof_slot_layout: ProofSlotLayout,
+) -> ReferenceLayeredCommitmentCarrier {
+    match (commitment_boundary, proof_slot_layout) {
+        (shroud_batch_opening::CommitmentBoundary::SharedPcsHook, _) => {
+            ReferenceLayeredCommitmentCarrier::SharedBatchOpeningEnvelope
+        }
+        (
+            shroud_batch_opening::CommitmentBoundary::DedicatedAuxiliaryPath,
+            ProofSlotLayout::ReuseCurrentRandomSlot,
+        ) => ReferenceLayeredCommitmentCarrier::AuxiliaryRandomizerEnvelope,
+        (
+            shroud_batch_opening::CommitmentBoundary::DedicatedAuxiliaryPath,
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot,
+        ) => ReferenceLayeredCommitmentCarrier::DedicatedPerfectRandomizerEnvelope,
+    }
+}
+
+impl BatchOpeningAdapter for ReferenceLayeredAdapter {
+    type CommitmentSlot = ReferenceLayeredCommitmentCarrier;
+    type Error = ReferenceLayeredAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+    ) -> Result<BatchOpeningAdapterPlan<Self::CommitmentSlot>, Self::Error> {
+        Ok(BatchOpeningAdapterPlan::new(
+            spec.security_level(),
+            spec.commitment_boundary(),
+            layered_carrier_for_plan(
+                spec.commitment_boundary(),
+                proof_slot_layout(spec.randomizer_opening_payload()),
+            ),
+            spec.randomizer_opening_payload(),
+            2,
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+        plan: &BatchOpeningAdapterPlan<Self::CommitmentSlot>,
+    ) -> Result<(), Self::Error> {
+        let expected_carrier =
+            layered_carrier_for_plan(plan.commitment_boundary(), plan.proof_slot_layout());
+
+        if *plan.commitment_slot() != expected_carrier {
+            return Err(ReferenceLayeredAdapterError::CommitmentCarrierMismatch {
+                expected: expected_carrier,
+                observed: *plan.commitment_slot(),
+            });
+        }
+
+        if plan.security_level() != spec.security_level()
+            || plan.commitment_boundary() != spec.commitment_boundary()
+            || plan.opening_payload() != spec.randomizer_opening_payload()
+        {
+            return Err(ReferenceLayeredAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl OpeningProjectionAdapter for ReferencePlonky3Adapter {
+    type PublicOpeningSlot = ReferencePlonky3PublicOpeningSlot;
+    type HiddenAuxiliarySlot = ReferencePlonky3HiddenAuxiliarySlot;
+    type Error = ReferenceProjectionAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudOpeningProjectionSpec,
+    ) -> Result<
+        OpeningProjectionAdapterPlan<Self::PublicOpeningSlot, Self::HiddenAuxiliarySlot>,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            AuxiliaryOpeningTransport::InBandWithMainProof => {
+                ReferencePlonky3HiddenAuxiliarySlot::FriOpeningProofInternals
+            }
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3HiddenAuxiliarySlot::DedicatedProjectionField
+            }
+        };
+
+        Ok(OpeningProjectionAdapterPlan::new(
+            spec.security_level(),
+            ReferencePlonky3PublicOpeningSlot::OpenedValuesField,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudOpeningProjectionSpec,
+        plan: &OpeningProjectionAdapterPlan<Self::PublicOpeningSlot, Self::HiddenAuxiliarySlot>,
+    ) -> Result<(), Self::Error> {
+        if *plan.public_opening_slot() != ReferencePlonky3PublicOpeningSlot::OpenedValuesField {
+            return Err(ReferenceProjectionAdapterError::PublicOpeningSlotMismatch {
+                expected: ReferencePlonky3PublicOpeningSlot::OpenedValuesField,
+                observed: *plan.public_opening_slot(),
+            });
+        }
+
+        let expected_hidden_slot = match plan.payload().auxiliary_transport() {
+            AuxiliaryOpeningTransport::InBandWithMainProof => {
+                ReferencePlonky3HiddenAuxiliarySlot::FriOpeningProofInternals
+            }
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3HiddenAuxiliarySlot::DedicatedProjectionField
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_slot {
+            return Err(
+                ReferenceProjectionAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected: expected_hidden_slot,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level() || plan.payload() != spec.payload() {
+            return Err(ReferenceProjectionAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+/// Error raised by the layered opening-projection adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredProjectionAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD projection spec.
+    PlanMismatch,
+    /// The public opening carrier does not match the expected layered layout.
+    PublicCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredPublicOpeningCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredPublicOpeningCarrier,
+    },
+    /// The hidden auxiliary carrier does not match the expected layered layout.
+    HiddenCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredHiddenAuxiliaryCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredHiddenAuxiliaryCarrier,
+    },
+}
+
+impl fmt::Display for ReferenceLayeredProjectionAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "layered opening-projection adapter plan does not match the SHROUD spec"
+            ),
+            Self::PublicCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered public opening carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered hidden auxiliary carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceLayeredProjectionAdapterError {}
+
+/// Error raised by the layered oracle-commitment adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredOracleCommitmentAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD oracle-commitment spec.
+    PlanMismatch,
+    /// The commitment carrier does not match the expected layered layout.
+    CommitmentCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredOracleCommitmentCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredOracleCommitmentCarrier,
+    },
+    /// The public opening carrier does not match the expected layered layout.
+    PublicCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredOracleOpeningCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredOracleOpeningCarrier,
+    },
+    /// The hidden auxiliary carrier does not match the expected layered layout.
+    HiddenCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredOracleHiddenAuxiliaryCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredOracleHiddenAuxiliaryCarrier,
+    },
+}
+
+impl fmt::Display for ReferenceLayeredOracleCommitmentAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "layered oracle-commitment adapter plan does not match the SHROUD spec"
+            ),
+            Self::CommitmentCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered oracle commitment carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered oracle public carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered oracle hidden carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceLayeredOracleCommitmentAdapterError {}
+
+/// Error raised by the layered quotient-hider adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceLayeredQuotientHiderAdapterError {
+    /// The supplied outer proof-layout plan does not match the SHROUD quotient-hider spec.
+    PlanMismatch,
+    /// The commitment carrier does not match the expected layered layout.
+    CommitmentCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredQuotientCommitmentCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredQuotientCommitmentCarrier,
+    },
+    /// The public opening carrier does not match the expected layered layout.
+    PublicCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredQuotientOpeningCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredQuotientOpeningCarrier,
+    },
+    /// The hidden auxiliary carrier does not match the expected layered layout.
+    HiddenCarrierMismatch {
+        /// Carrier required by the adapter.
+        expected: ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
+        /// Carrier actually supplied.
+        observed: ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
+    },
+}
+
+impl fmt::Display for ReferenceLayeredQuotientHiderAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "layered quotient-hider adapter plan does not match the SHROUD spec"
+            ),
+            Self::CommitmentCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered quotient commitment carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered quotient public carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenCarrierMismatch { expected, observed } => write!(
+                f,
+                "layered quotient hidden carrier mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceLayeredQuotientHiderAdapterError {}
+
+impl OpeningProjectionAdapter for ReferenceLayeredAdapter {
+    type PublicOpeningSlot = ReferenceLayeredPublicOpeningCarrier;
+    type HiddenAuxiliarySlot = ReferenceLayeredHiddenAuxiliaryCarrier;
+    type Error = ReferenceLayeredProjectionAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudOpeningProjectionSpec,
+    ) -> Result<
+        OpeningProjectionAdapterPlan<Self::PublicOpeningSlot, Self::HiddenAuxiliarySlot>,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            AuxiliaryOpeningTransport::InBandWithMainProof => {
+                ReferenceLayeredHiddenAuxiliaryCarrier::MainOpeningProofEnvelope
+            }
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredHiddenAuxiliaryCarrier::ProjectionAuxiliaryEnvelope
+            }
+        };
+
+        Ok(OpeningProjectionAdapterPlan::new(
+            spec.security_level(),
+            ReferenceLayeredPublicOpeningCarrier::StatementOpeningEnvelope,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudOpeningProjectionSpec,
+        plan: &OpeningProjectionAdapterPlan<Self::PublicOpeningSlot, Self::HiddenAuxiliarySlot>,
+    ) -> Result<(), Self::Error> {
+        if *plan.public_opening_slot()
+            != ReferenceLayeredPublicOpeningCarrier::StatementOpeningEnvelope
+        {
+            return Err(
+                ReferenceLayeredProjectionAdapterError::PublicCarrierMismatch {
+                    expected: ReferenceLayeredPublicOpeningCarrier::StatementOpeningEnvelope,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        let expected_hidden_carrier = match plan.payload().auxiliary_transport() {
+            AuxiliaryOpeningTransport::InBandWithMainProof => {
+                ReferenceLayeredHiddenAuxiliaryCarrier::MainOpeningProofEnvelope
+            }
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredHiddenAuxiliaryCarrier::ProjectionAuxiliaryEnvelope
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_carrier {
+            return Err(
+                ReferenceLayeredProjectionAdapterError::HiddenCarrierMismatch {
+                    expected: expected_hidden_carrier,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level() || plan.payload() != spec.payload() {
+            return Err(ReferenceLayeredProjectionAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl OracleCommitmentAdapter for ReferencePlonky3Adapter {
+    type CommitmentSlot = ReferencePlonky3OracleCommitmentSlot;
+    type PublicOpeningSlot = ReferencePlonky3OracleOpeningSlot;
+    type HiddenAuxiliarySlot = ReferencePlonky3OracleHiddenAuxiliarySlot;
+    type Error = ReferenceOracleCommitmentAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudOracleCommitmentSpec,
+    ) -> Result<
+        OracleCommitmentAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            OracleAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferencePlonky3OracleHiddenAuxiliarySlot::HidingMmcsInternals
+            }
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3OracleHiddenAuxiliarySlot::DedicatedOracleWitnessField
+            }
+        };
+
+        Ok(OracleCommitmentAdapterPlan::new(
+            spec.security_level(),
+            ReferencePlonky3OracleCommitmentSlot::OracleCommitmentField,
+            ReferencePlonky3OracleOpeningSlot::MmcsOpeningProof,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudOracleCommitmentSpec,
+        plan: &OracleCommitmentAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+    ) -> Result<(), Self::Error> {
+        if *plan.commitment_slot() != ReferencePlonky3OracleCommitmentSlot::OracleCommitmentField {
+            return Err(
+                ReferenceOracleCommitmentAdapterError::CommitmentSlotMismatch {
+                    expected: ReferencePlonky3OracleCommitmentSlot::OracleCommitmentField,
+                    observed: *plan.commitment_slot(),
+                },
+            );
+        }
+
+        if *plan.public_opening_slot() != ReferencePlonky3OracleOpeningSlot::MmcsOpeningProof {
+            return Err(
+                ReferenceOracleCommitmentAdapterError::PublicOpeningSlotMismatch {
+                    expected: ReferencePlonky3OracleOpeningSlot::MmcsOpeningProof,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        let expected_hidden_slot = match plan.payload().auxiliary_transport() {
+            OracleAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferencePlonky3OracleHiddenAuxiliarySlot::HidingMmcsInternals
+            }
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3OracleHiddenAuxiliarySlot::DedicatedOracleWitnessField
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_slot {
+            return Err(
+                ReferenceOracleCommitmentAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected: expected_hidden_slot,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level() || plan.payload() != spec.payload() {
+            return Err(ReferenceOracleCommitmentAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl OracleCommitmentAdapter for ReferenceLayeredAdapter {
+    type CommitmentSlot = ReferenceLayeredOracleCommitmentCarrier;
+    type PublicOpeningSlot = ReferenceLayeredOracleOpeningCarrier;
+    type HiddenAuxiliarySlot = ReferenceLayeredOracleHiddenAuxiliaryCarrier;
+    type Error = ReferenceLayeredOracleCommitmentAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudOracleCommitmentSpec,
+    ) -> Result<
+        OracleCommitmentAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            OracleAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleOpeningEnvelope
+            }
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleAuxiliaryWitnessEnvelope
+            }
+        };
+
+        Ok(OracleCommitmentAdapterPlan::new(
+            spec.security_level(),
+            ReferenceLayeredOracleCommitmentCarrier::OracleCommitmentEnvelope,
+            ReferenceLayeredOracleOpeningCarrier::OracleOpeningEnvelope,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudOracleCommitmentSpec,
+        plan: &OracleCommitmentAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+    ) -> Result<(), Self::Error> {
+        if *plan.commitment_slot()
+            != ReferenceLayeredOracleCommitmentCarrier::OracleCommitmentEnvelope
+        {
+            return Err(
+                ReferenceLayeredOracleCommitmentAdapterError::CommitmentCarrierMismatch {
+                    expected: ReferenceLayeredOracleCommitmentCarrier::OracleCommitmentEnvelope,
+                    observed: *plan.commitment_slot(),
+                },
+            );
+        }
+
+        if *plan.public_opening_slot()
+            != ReferenceLayeredOracleOpeningCarrier::OracleOpeningEnvelope
+        {
+            return Err(
+                ReferenceLayeredOracleCommitmentAdapterError::PublicCarrierMismatch {
+                    expected: ReferenceLayeredOracleOpeningCarrier::OracleOpeningEnvelope,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        let expected_hidden_carrier = match plan.payload().auxiliary_transport() {
+            OracleAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleOpeningEnvelope
+            }
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleAuxiliaryWitnessEnvelope
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_carrier {
+            return Err(
+                ReferenceLayeredOracleCommitmentAdapterError::HiddenCarrierMismatch {
+                    expected: expected_hidden_carrier,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level() || plan.payload() != spec.payload() {
+            return Err(ReferenceLayeredOracleCommitmentAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl QuotientHiderAdapter for ReferencePlonky3Adapter {
+    type CommitmentSlot = ReferencePlonky3QuotientCommitmentSlot;
+    type PublicOpeningSlot = ReferencePlonky3QuotientOpeningSlot;
+    type HiddenAuxiliarySlot = ReferencePlonky3QuotientHiddenAuxiliarySlot;
+    type Error = ReferenceQuotientHiderAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudQuotientHiderSpec,
+    ) -> Result<
+        QuotientHiderAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            QuotientAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals
+            }
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3QuotientHiddenAuxiliarySlot::DedicatedQuotientWitnessField
+            }
+        };
+
+        Ok(QuotientHiderAdapterPlan::new(
+            spec.security_level(),
+            spec.decomposition_family(),
+            spec.query_budget(),
+            ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField,
+            ReferencePlonky3QuotientOpeningSlot::OpenedQuotientValuesField,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudQuotientHiderSpec,
+        plan: &QuotientHiderAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+    ) -> Result<(), Self::Error> {
+        if *plan.commitment_slot()
+            != ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField
+        {
+            return Err(ReferenceQuotientHiderAdapterError::CommitmentSlotMismatch {
+                expected: ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField,
+                observed: *plan.commitment_slot(),
+            });
+        }
+
+        if *plan.public_opening_slot()
+            != ReferencePlonky3QuotientOpeningSlot::OpenedQuotientValuesField
+        {
+            return Err(
+                ReferenceQuotientHiderAdapterError::PublicOpeningSlotMismatch {
+                    expected: ReferencePlonky3QuotientOpeningSlot::OpenedQuotientValuesField,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        let expected_hidden_slot = match plan.payload().auxiliary_transport() {
+            QuotientAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals
+            }
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferencePlonky3QuotientHiddenAuxiliarySlot::DedicatedQuotientWitnessField
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_slot {
+            return Err(
+                ReferenceQuotientHiderAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected: expected_hidden_slot,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level()
+            || plan.decomposition_family() != spec.decomposition_family()
+            || plan.query_budget() != spec.query_budget()
+            || plan.payload() != spec.payload()
+        {
+            return Err(ReferenceQuotientHiderAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl QuotientHiderAdapter for ReferenceLayeredAdapter {
+    type CommitmentSlot = ReferenceLayeredQuotientCommitmentCarrier;
+    type PublicOpeningSlot = ReferenceLayeredQuotientOpeningCarrier;
+    type HiddenAuxiliarySlot = ReferenceLayeredQuotientHiddenAuxiliaryCarrier;
+    type Error = ReferenceLayeredQuotientHiderAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudQuotientHiderSpec,
+    ) -> Result<
+        QuotientHiderAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+        Self::Error,
+    > {
+        let hidden_auxiliary_slot = match spec.auxiliary_transport() {
+            QuotientAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope
+            }
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientAuxiliaryEnvelope
+            }
+        };
+
+        Ok(QuotientHiderAdapterPlan::new(
+            spec.security_level(),
+            spec.decomposition_family(),
+            spec.query_budget(),
+            ReferenceLayeredQuotientCommitmentCarrier::QuotientCommitmentEnvelope,
+            ReferenceLayeredQuotientOpeningCarrier::QuotientOpeningEnvelope,
+            hidden_auxiliary_slot,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudQuotientHiderSpec,
+        plan: &QuotientHiderAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+    ) -> Result<(), Self::Error> {
+        if *plan.commitment_slot()
+            != ReferenceLayeredQuotientCommitmentCarrier::QuotientCommitmentEnvelope
+        {
+            return Err(
+                ReferenceLayeredQuotientHiderAdapterError::CommitmentCarrierMismatch {
+                    expected: ReferenceLayeredQuotientCommitmentCarrier::QuotientCommitmentEnvelope,
+                    observed: *plan.commitment_slot(),
+                },
+            );
+        }
+
+        if *plan.public_opening_slot()
+            != ReferenceLayeredQuotientOpeningCarrier::QuotientOpeningEnvelope
+        {
+            return Err(
+                ReferenceLayeredQuotientHiderAdapterError::PublicCarrierMismatch {
+                    expected: ReferenceLayeredQuotientOpeningCarrier::QuotientOpeningEnvelope,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        let expected_hidden_carrier = match plan.payload().auxiliary_transport() {
+            QuotientAuxiliaryTransport::InBandWithOpeningProof => {
+                ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope
+            }
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof => {
+                ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientAuxiliaryEnvelope
+            }
+        };
+
+        if *plan.hidden_auxiliary_slot() != expected_hidden_carrier {
+            return Err(
+                ReferenceLayeredQuotientHiderAdapterError::HiddenCarrierMismatch {
+                    expected: expected_hidden_carrier,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        if plan.security_level() != spec.security_level()
+            || plan.decomposition_family() != spec.decomposition_family()
+            || plan.query_budget() != spec.query_budget()
+            || plan.payload() != spec.payload()
+        {
+            return Err(ReferenceLayeredQuotientHiderAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl BatchOpeningAdapter for ReferencePlonky3Adapter {
+    type CommitmentSlot = ReferencePlonky3CommitmentSlot;
+    type Error = ReferenceAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+    ) -> Result<BatchOpeningAdapterPlan<Self::CommitmentSlot>, Self::Error> {
+        let commitment_slot = match spec.randomizer_opening_payload() {
+            RandomizerOpeningPayload::Statistical(_) => {
+                ReferencePlonky3CommitmentSlot::RandomOptionField
+            }
+            RandomizerOpeningPayload::Perfect(payload) => match payload.proof_slot_layout() {
+                ProofSlotLayout::ReuseCurrentRandomSlot => {
+                    ReferencePlonky3CommitmentSlot::RandomOptionField
+                }
+                ProofSlotLayout::DedicatedPerfectRandomizerSlot => {
+                    ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField
+                }
+            },
+        };
+
+        Ok(BatchOpeningAdapterPlan::new(
+            spec.security_level(),
+            spec.commitment_boundary(),
+            commitment_slot,
+            spec.randomizer_opening_payload(),
+            2,
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+        plan: &BatchOpeningAdapterPlan<Self::CommitmentSlot>,
+    ) -> Result<(), Self::Error> {
+        let expected_slot = match plan.proof_slot_layout() {
+            ProofSlotLayout::ReuseCurrentRandomSlot => {
+                ReferencePlonky3CommitmentSlot::RandomOptionField
+            }
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot => {
+                ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField
+            }
+        };
+
+        if *plan.commitment_slot() != expected_slot {
+            return Err(ReferenceAdapterError::CommitmentSlotMismatch {
+                expected: expected_slot,
+                observed: *plan.commitment_slot(),
+            });
+        }
+
+        if plan.security_level() != spec.security_level()
+            || plan.commitment_boundary() != spec.commitment_boundary()
+            || plan.opening_payload() != spec.randomizer_opening_payload()
+        {
+            return Err(ReferenceAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+impl PerfectRandomizerAdapter for ReferencePlonky3Adapter {
+    type CommitmentSlot = ReferencePlonky3CommitmentSlot;
+    type Error = ReferenceAdapterError;
+
+    fn surface(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+    ) -> Result<PerfectRandomizerAdapterSurface<Self::CommitmentSlot>, Self::Error> {
+        let payload = match spec.randomizer_opening_payload() {
+            RandomizerOpeningPayload::Perfect(payload) => payload,
+            RandomizerOpeningPayload::Statistical(_) => {
+                return Err(ReferenceAdapterError::ExpectedPerfectVariant);
+            }
+        };
+
+        let commitment_slot = match payload.proof_slot_layout() {
+            ProofSlotLayout::ReuseCurrentRandomSlot => {
+                ReferencePlonky3CommitmentSlot::RandomOptionField
+            }
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot => {
+                ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField
+            }
+        };
+
+        Ok(PerfectRandomizerAdapterSurface::new(
+            commitment_slot,
+            payload.proof_slot_layout(),
+            payload,
+        ))
+    }
+
+    fn reconstruct(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+        surface: &PerfectRandomizerAdapterSurface<Self::CommitmentSlot>,
+    ) -> Result<PerfectRandomizerReconstruction, Self::Error> {
+        let model = spec
+            .perfect_randomizer_commitment()
+            .ok_or(ReferenceAdapterError::ExpectedPerfectVariant)?;
+
+        let expected_slot = match surface.proof_slot_layout() {
+            ProofSlotLayout::ReuseCurrentRandomSlot => {
+                ReferencePlonky3CommitmentSlot::RandomOptionField
+            }
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot => {
+                ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField
+            }
+        };
+
+        if *surface.commitment_slot() != expected_slot {
+            return Err(ReferenceAdapterError::CommitmentSlotMismatch {
+                expected: expected_slot,
+                observed: *surface.commitment_slot(),
+            });
+        }
+
+        Ok(PerfectRandomizerReconstruction::new(
+            model,
+            surface.opening_payload(),
+        ))
+    }
+}
+
+impl PerfectRandomizerBackend for ReferencePerfectRandomizerBackend {
+    type Commitment = ReferencePerfectRandomizerCommitment;
+    type ProverState = ReferencePerfectRandomizerState;
+    type PublicEvaluation = ReferencePublicEvaluation;
+    type HiddenOpening = ReferenceHiddenOpening;
+    type Error = ReferencePerfectRandomizerError;
+
+    fn commitment_model(&self) -> PerfectRandomizerCommitment {
+        self.model
+    }
+
+    fn commit(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+    ) -> Result<PreparedPerfectRandomizer<Self::Commitment, Self::ProverState>, Self::Error> {
+        let observed = spec
+            .perfect_randomizer_commitment()
+            .ok_or(ReferencePerfectRandomizerError::ExpectedPerfectVariant)?;
+
+        if observed != self.model {
+            return Err(ReferencePerfectRandomizerError::CommitmentModelMismatch {
+                expected: self.model,
+                observed,
+            });
+        }
+
+        Ok(PreparedPerfectRandomizer::new(
+            ReferencePerfectRandomizerCommitment {
+                model: self.model,
+                shape: spec.shape(),
+            },
+            ReferencePerfectRandomizerState {
+                shape: spec.shape(),
+            },
+        ))
+    }
+
+    fn open(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+        prover_state: &Self::ProverState,
+    ) -> Result<PerfectRandomizerOpening<Self::PublicEvaluation, Self::HiddenOpening>, Self::Error>
+    {
+        let observed = spec
+            .perfect_randomizer_commitment()
+            .ok_or(ReferencePerfectRandomizerError::ExpectedPerfectVariant)?;
+
+        if observed != self.model {
+            return Err(ReferencePerfectRandomizerError::CommitmentModelMismatch {
+                expected: self.model,
+                observed,
+            });
+        }
+
+        let payload = match spec.randomizer_opening_payload() {
+            RandomizerOpeningPayload::Perfect(payload) => payload,
+            RandomizerOpeningPayload::Statistical(_) => {
+                return Err(ReferencePerfectRandomizerError::ExpectedPerfectVariant);
+            }
+        };
+
+        let public_evaluations = (0..payload.public_extension_evaluations())
+            .map(|point_index| ReferencePublicEvaluation { point_index })
+            .collect();
+
+        let hidden_openings = match payload.hidden_payload() {
+            PerfectHiddenOpeningPayload::EncodedCoordinates {
+                base_field_coordinate_evaluations,
+                transport,
+            } => ReferenceHiddenOpening {
+                evaluation_count: base_field_coordinate_evaluations,
+                transport,
+            },
+            PerfectHiddenOpeningPayload::BackendProofOnly { transport } => ReferenceHiddenOpening {
+                evaluation_count: 0,
+                transport,
+            },
+        };
+
+        let _ = prover_state.shape();
+
+        Ok(PerfectRandomizerOpening::new(
+            public_evaluations,
+            hidden_openings,
+        ))
+    }
+
+    fn reconstruct(
+        &self,
+        spec: &ShroudBatchOpeningSpec,
+        commitment: &Self::Commitment,
+        opening: &PerfectRandomizerOpening<Self::PublicEvaluation, Self::HiddenOpening>,
+    ) -> Result<PerfectRandomizerReconstruction, Self::Error> {
+        let observed = spec
+            .perfect_randomizer_commitment()
+            .ok_or(ReferencePerfectRandomizerError::ExpectedPerfectVariant)?;
+
+        if observed != self.model || commitment.model() != self.model {
+            return Err(ReferencePerfectRandomizerError::CommitmentModelMismatch {
+                expected: self.model,
+                observed: commitment.model(),
+            });
+        }
+
+        let payload = match spec.randomizer_opening_payload() {
+            RandomizerOpeningPayload::Perfect(payload) => payload,
+            RandomizerOpeningPayload::Statistical(_) => {
+                return Err(ReferencePerfectRandomizerError::ExpectedPerfectVariant);
+            }
+        };
+
+        let observed_public = opening.public_evaluations().len();
+        if observed_public != payload.public_extension_evaluations() {
+            return Err(
+                ReferencePerfectRandomizerError::PublicEvaluationCountMismatch {
+                    expected: payload.public_extension_evaluations(),
+                    observed: observed_public,
+                },
+            );
+        }
+
+        let hidden_openings = opening.hidden_openings();
+        let (expected_evaluations, expected_transport) = match payload.hidden_payload() {
+            PerfectHiddenOpeningPayload::EncodedCoordinates {
+                base_field_coordinate_evaluations,
+                transport,
+            } => (base_field_coordinate_evaluations, transport),
+            PerfectHiddenOpeningPayload::BackendProofOnly { transport } => (0, transport),
+        };
+
+        if hidden_openings.evaluation_count() != expected_evaluations
+            || hidden_openings.transport() != expected_transport
+        {
+            return Err(ReferencePerfectRandomizerError::HiddenOpeningMismatch {
+                expected_evaluations,
+                observed_evaluations: hidden_openings.evaluation_count(),
+                expected_transport,
+                observed_transport: hidden_openings.transport(),
+            });
+        }
+
+        Ok(PerfectRandomizerReconstruction::new(self.model, payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ReferenceAdapterError, ReferenceLayeredAdapter, ReferenceLayeredAdapterError,
+        ReferenceLayeredCommitmentCarrier, ReferenceLayeredHiddenAuxiliaryCarrier,
+        ReferenceLayeredOracleCommitmentAdapterError, ReferenceLayeredOracleCommitmentCarrier,
+        ReferenceLayeredOracleHiddenAuxiliaryCarrier, ReferenceLayeredOracleOpeningCarrier,
+        ReferenceLayeredProjectionAdapterError, ReferenceLayeredPublicOpeningCarrier,
+        ReferenceLayeredQuotientCommitmentCarrier, ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
+        ReferenceLayeredQuotientHiderAdapterError, ReferenceLayeredQuotientOpeningCarrier,
+        ReferenceOracleCommitmentAdapterError, ReferencePerfectRandomizerBackend,
+        ReferencePerfectRandomizerError, ReferencePlonky3Adapter, ReferencePlonky3CommitmentSlot,
+        ReferencePlonky3HiddenAuxiliarySlot, ReferencePlonky3OracleCommitmentSlot,
+        ReferencePlonky3OracleHiddenAuxiliarySlot, ReferencePlonky3OracleOpeningSlot,
+        ReferencePlonky3PublicOpeningSlot, ReferencePlonky3QuotientCommitmentSlot,
+        ReferencePlonky3QuotientHiddenAuxiliarySlot, ReferencePlonky3QuotientOpeningSlot,
+        ReferenceProjectionAdapterError, ReferenceQuotientHiderAdapterError, ReferenceTranscript,
+        ReferenceTranscriptError,
+    };
+    use shroud_adapter::{
+        BatchOpeningAdapter, BatchOpeningAdapterPlan, OpeningProjectionAdapter,
+        OpeningProjectionAdapterPlan, OracleCommitmentAdapter, OracleCommitmentAdapterPlan,
+        QuotientHiderAdapter, QuotientHiderAdapterPlan,
+    };
+    use shroud_batch_opening::{
+        BatchOpeningShape, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
+        PerfectRandomizerAdapter, PerfectRandomizerBackend, PerfectRandomizerCommitment,
+        PerfectRandomizerReconstruction, ProofSlotLayout, ShroudBatchOpeningSpec,
+    };
+    use shroud_core::{SecurityLevel, TranscriptStage};
+    use shroud_opening_projection::{
+        AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
+    };
+    use shroud_oracle_commitment::{
+        OracleAuxiliaryTransport, OracleCommitmentShape, ShroudOracleCommitmentSpec,
+    };
+    use shroud_quotient_hider::{
+        QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientHiderShape,
+        ShroudQuotientHiderSpec,
+    };
+
+    #[test]
+    fn accepts_the_standard_statistical_flow() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+        let mut transcript = ReferenceTranscript::new(&spec);
+
+        for stage in spec.transcript_plan().stages() {
+            transcript
+                .advance(*stage)
+                .expect("stage should be accepted");
+        }
+
+        assert!(transcript.is_complete());
+    }
+
+    #[test]
+    fn rejects_sampling_ood_point_before_randomizer_commitment() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        )
+        .expect("valid spec");
+        let mut transcript = ReferenceTranscript::new(&spec);
+
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("first stage should be accepted");
+        transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .expect("second stage should be accepted");
+        transcript
+            .advance(TranscriptStage::ObserveQuotientCommitments)
+            .expect("third stage should be accepted");
+
+        assert_eq!(
+            transcript.advance(TranscriptStage::SampleOodPoint),
+            Err(ReferenceTranscriptError::UnexpectedStage {
+                expected: TranscriptStage::ObserveRandomizerCommitment,
+                observed: TranscriptStage::SampleOodPoint,
+            })
+        );
+    }
+
+    #[test]
+    fn encoded_backend_round_trips_through_commit_observe_open_and_reconstruct() {
+        let shape = BatchOpeningShape::new(5, 2, 3).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            31,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        )
+        .expect("valid spec");
+        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle();
+        let prepared = backend.commit(&spec).expect("commit should succeed");
+
+        let mut transcript = ReferenceTranscript::new(&spec);
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("first stage should be accepted");
+        transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .expect("second stage should be accepted");
+        transcript
+            .advance(TranscriptStage::ObserveQuotientCommitments)
+            .expect("third stage should be accepted");
+
+        backend
+            .observe(&mut transcript, prepared.commitment())
+            .expect("observation should succeed");
+        assert_eq!(
+            transcript.expected_stage(),
+            Some(TranscriptStage::SampleOodPoint)
+        );
+
+        let opening = backend
+            .open(&spec, prepared.prover_state())
+            .expect("opening should succeed");
+        let reconstruction = backend
+            .reconstruct(&spec, prepared.commitment(), &opening)
+            .expect("reconstruction should succeed");
+
+        assert_eq!(
+            reconstruction.commitment(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle()
+        );
+        assert_eq!(
+            reconstruction.opening_payload().proof_slot_layout(),
+            ProofSlotLayout::ReuseCurrentRandomSlot
+        );
+        assert_eq!(
+            reconstruction.opening_payload().hidden_payload(),
+            PerfectHiddenOpeningPayload::EncodedCoordinates {
+                base_field_coordinate_evaluations: 6,
+                transport: HiddenOpeningTransport::InBandWithMainOpeningProof,
+            }
+        );
+    }
+
+    #[test]
+    fn native_backend_reconstructs_backend_only_hidden_payload() {
+        let shape = BatchOpeningShape::new(3, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::native_extension_pcs(),
+        )
+        .expect("valid spec");
+        let backend = ReferencePerfectRandomizerBackend::native_extension_pcs();
+        let prepared = backend.commit(&spec).expect("commit should succeed");
+        let opening = backend
+            .open(&spec, prepared.prover_state())
+            .expect("opening should succeed");
+        let reconstruction = backend
+            .reconstruct(&spec, prepared.commitment(), &opening)
+            .expect("reconstruction should succeed");
+
+        assert_eq!(
+            reconstruction.opening_payload().proof_slot_layout(),
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot
+        );
+        assert_eq!(
+            reconstruction.opening_payload().hidden_payload(),
+            PerfectHiddenOpeningPayload::BackendProofOnly {
+                transport: HiddenOpeningTransport::SeparateAuxiliaryProof,
+            }
+        );
+    }
+
+    #[test]
+    fn backend_rejects_mismatched_perfect_commitment_model() {
+        let shape = BatchOpeningShape::new(3, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::native_extension_pcs(),
+        )
+        .expect("valid spec");
+        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle();
+
+        assert_eq!(
+            backend.commit(&spec),
+            Err(ReferencePerfectRandomizerError::CommitmentModelMismatch {
+                expected: PerfectRandomizerCommitment::encoded_oracle_bundle(),
+                observed: PerfectRandomizerCommitment::native_extension_pcs(),
+            })
+        );
+    }
+
+    #[test]
+    fn adapter_maps_encoded_bundle_to_existing_random_slot() {
+        let shape = BatchOpeningShape::new(5, 2, 3).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            31,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let surface = adapter.surface(&spec).expect("surface should be built");
+        assert_eq!(
+            *surface.commitment_slot(),
+            ReferencePlonky3CommitmentSlot::RandomOptionField
+        );
+        assert_eq!(
+            surface.proof_slot_layout(),
+            ProofSlotLayout::ReuseCurrentRandomSlot
+        );
+
+        let reconstruction = adapter
+            .reconstruct(&spec, &surface)
+            .expect("reconstruction should succeed");
+        assert_eq!(
+            reconstruction,
+            PerfectRandomizerReconstruction::new(
+                PerfectRandomizerCommitment::encoded_oracle_bundle(),
+                surface.opening_payload(),
+            )
+        );
+    }
+
+    #[test]
+    fn adapter_maps_native_extension_to_dedicated_slot() {
+        let shape = BatchOpeningShape::new(3, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::native_extension_pcs(),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let surface = adapter.surface(&spec).expect("surface should be built");
+        assert_eq!(
+            *surface.commitment_slot(),
+            ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField
+        );
+        assert_eq!(
+            surface.proof_slot_layout(),
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot
+        );
+    }
+
+    #[test]
+    fn adapter_rejects_statistical_specs() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        assert_eq!(
+            adapter.surface(&spec),
+            Err(ReferenceAdapterError::ExpectedPerfectVariant)
+        );
+    }
+
+    #[test]
+    fn backend_neutral_plan_covers_statistical_specs_too() {
+        let shape = BatchOpeningShape::new(5, 2, 4).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 31).expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = BatchOpeningAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(plan.security_level(), SecurityLevel::Statistical);
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferencePlonky3CommitmentSlot::RandomOptionField
+        );
+        assert_eq!(
+            plan.proof_slot_layout(),
+            ProofSlotLayout::ReuseCurrentRandomSlot
+        );
+        BatchOpeningAdapter::validate(&adapter, &spec, &plan)
+            .expect("statistical plan should validate");
+    }
+
+    #[test]
+    fn backend_neutral_plan_can_detect_slot_mismatches() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::native_extension_pcs(),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let bad_plan = BatchOpeningAdapterPlan::new(
+            SecurityLevel::Perfect,
+            spec.commitment_boundary(),
+            ReferencePlonky3CommitmentSlot::RandomOptionField,
+            spec.randomizer_opening_payload(),
+            2,
+        );
+
+        assert_eq!(
+            BatchOpeningAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(ReferenceAdapterError::CommitmentSlotMismatch {
+                expected: ReferencePlonky3CommitmentSlot::DedicatedPerfectRandomizerField,
+                observed: ReferencePlonky3CommitmentSlot::RandomOptionField,
+            })
+        );
+    }
+
+    #[test]
+    fn layered_adapter_maps_statistical_specs_to_shared_envelope() {
+        let shape = BatchOpeningShape::new(5, 2, 4).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 31).expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = BatchOpeningAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(plan.security_level(), SecurityLevel::Statistical);
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferenceLayeredCommitmentCarrier::SharedBatchOpeningEnvelope
+        );
+        BatchOpeningAdapter::validate(&adapter, &spec, &plan)
+            .expect("statistical plan should validate");
+    }
+
+    #[test]
+    fn layered_adapter_maps_encoded_perfect_specs_to_auxiliary_envelope() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = BatchOpeningAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(plan.security_level(), SecurityLevel::Perfect);
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferenceLayeredCommitmentCarrier::AuxiliaryRandomizerEnvelope
+        );
+        assert_eq!(
+            plan.proof_slot_layout(),
+            ProofSlotLayout::ReuseCurrentRandomSlot
+        );
+        BatchOpeningAdapter::validate(&adapter, &spec, &plan)
+            .expect("encoded perfect plan should validate");
+    }
+
+    #[test]
+    fn layered_adapter_maps_native_perfect_specs_to_dedicated_envelope() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::native_extension_pcs(),
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = BatchOpeningAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferenceLayeredCommitmentCarrier::DedicatedPerfectRandomizerEnvelope
+        );
+        assert_eq!(
+            plan.proof_slot_layout(),
+            ProofSlotLayout::DedicatedPerfectRandomizerSlot
+        );
+    }
+
+    #[test]
+    fn layered_adapter_detects_carrier_mismatches() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let bad_plan = BatchOpeningAdapterPlan::new(
+            SecurityLevel::Perfect,
+            spec.commitment_boundary(),
+            ReferenceLayeredCommitmentCarrier::SharedBatchOpeningEnvelope,
+            spec.randomizer_opening_payload(),
+            2,
+        );
+
+        assert_eq!(
+            BatchOpeningAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(ReferenceLayeredAdapterError::CommitmentCarrierMismatch {
+                expected: ReferenceLayeredCommitmentCarrier::AuxiliaryRandomizerEnvelope,
+                observed: ReferenceLayeredCommitmentCarrier::SharedBatchOpeningEnvelope,
+            })
+        );
+    }
+
+    #[test]
+    fn plonky3_projection_adapter_maps_statistical_projection_in_band() {
+        let shape = OpeningProjectionShape::new(3, 5, 2).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::statistical(
+            shape,
+            AuxiliaryOpeningTransport::InBandWithMainProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = OpeningProjectionAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferencePlonky3PublicOpeningSlot::OpenedValuesField
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3HiddenAuxiliarySlot::FriOpeningProofInternals
+        );
+        OpeningProjectionAdapter::validate(&adapter, &spec, &plan)
+            .expect("statistical projection plan should validate");
+    }
+
+    #[test]
+    fn plonky3_projection_adapter_maps_perfect_projection_to_dedicated_field() {
+        let shape = OpeningProjectionShape::new(2, 6, 3).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::perfect(
+            shape,
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = OpeningProjectionAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3HiddenAuxiliarySlot::DedicatedProjectionField
+        );
+        OpeningProjectionAdapter::validate(&adapter, &spec, &plan)
+            .expect("perfect projection plan should validate");
+    }
+
+    #[test]
+    fn plonky3_projection_adapter_detects_hidden_slot_mismatches() {
+        let shape = OpeningProjectionShape::new(2, 6, 3).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::perfect(
+            shape,
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let bad_plan = OpeningProjectionAdapterPlan::new(
+            SecurityLevel::Perfect,
+            ReferencePlonky3PublicOpeningSlot::OpenedValuesField,
+            ReferencePlonky3HiddenAuxiliarySlot::FriOpeningProofInternals,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            OpeningProjectionAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceProjectionAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected: ReferencePlonky3HiddenAuxiliarySlot::DedicatedProjectionField,
+                    observed: ReferencePlonky3HiddenAuxiliarySlot::FriOpeningProofInternals,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn layered_projection_adapter_maps_statistical_projection_to_main_envelope() {
+        let shape = OpeningProjectionShape::new(3, 5, 2).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::statistical(
+            shape,
+            AuxiliaryOpeningTransport::InBandWithMainProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = OpeningProjectionAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferenceLayeredPublicOpeningCarrier::StatementOpeningEnvelope
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredHiddenAuxiliaryCarrier::MainOpeningProofEnvelope
+        );
+        OpeningProjectionAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered statistical projection plan should validate");
+    }
+
+    #[test]
+    fn layered_projection_adapter_maps_perfect_projection_to_auxiliary_envelope() {
+        let shape = OpeningProjectionShape::new(2, 6, 3).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::perfect(
+            shape,
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = OpeningProjectionAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredHiddenAuxiliaryCarrier::ProjectionAuxiliaryEnvelope
+        );
+        OpeningProjectionAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered perfect projection plan should validate");
+    }
+
+    #[test]
+    fn layered_projection_adapter_detects_hidden_carrier_mismatches() {
+        let shape = OpeningProjectionShape::new(2, 6, 3).expect("valid shape");
+        let spec = ShroudOpeningProjectionSpec::perfect(
+            shape,
+            AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let bad_plan = OpeningProjectionAdapterPlan::new(
+            SecurityLevel::Perfect,
+            ReferenceLayeredPublicOpeningCarrier::StatementOpeningEnvelope,
+            ReferenceLayeredHiddenAuxiliaryCarrier::MainOpeningProofEnvelope,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            OpeningProjectionAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceLayeredProjectionAdapterError::HiddenCarrierMismatch {
+                    expected: ReferenceLayeredHiddenAuxiliaryCarrier::ProjectionAuxiliaryEnvelope,
+                    observed: ReferenceLayeredHiddenAuxiliaryCarrier::MainOpeningProofEnvelope,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn plonky3_oracle_adapter_maps_statistical_oracle_in_band() {
+        let shape = OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::statistical(
+            shape,
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = OracleCommitmentAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferencePlonky3OracleCommitmentSlot::OracleCommitmentField
+        );
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferencePlonky3OracleOpeningSlot::MmcsOpeningProof
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3OracleHiddenAuxiliarySlot::HidingMmcsInternals
+        );
+        OracleCommitmentAdapter::validate(&adapter, &spec, &plan)
+            .expect("statistical oracle plan should validate");
+    }
+
+    #[test]
+    fn plonky3_oracle_adapter_maps_perfect_oracle_to_dedicated_field() {
+        let shape = OracleCommitmentShape::new(1, 2, 8, 4, 2).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::perfect(
+            shape,
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = OracleCommitmentAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3OracleHiddenAuxiliarySlot::DedicatedOracleWitnessField
+        );
+        OracleCommitmentAdapter::validate(&adapter, &spec, &plan)
+            .expect("perfect oracle plan should validate");
+    }
+
+    #[test]
+    fn plonky3_oracle_adapter_detects_hidden_slot_mismatches() {
+        let shape = OracleCommitmentShape::new(1, 2, 8, 4, 2).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::perfect(
+            shape,
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let bad_plan = OracleCommitmentAdapterPlan::new(
+            SecurityLevel::Perfect,
+            ReferencePlonky3OracleCommitmentSlot::OracleCommitmentField,
+            ReferencePlonky3OracleOpeningSlot::MmcsOpeningProof,
+            ReferencePlonky3OracleHiddenAuxiliarySlot::HidingMmcsInternals,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            OracleCommitmentAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceOracleCommitmentAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected:
+                        ReferencePlonky3OracleHiddenAuxiliarySlot::DedicatedOracleWitnessField,
+                    observed: ReferencePlonky3OracleHiddenAuxiliarySlot::HidingMmcsInternals,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn layered_oracle_adapter_maps_statistical_oracle_to_opening_envelope() {
+        let shape = OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::statistical(
+            shape,
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = OracleCommitmentAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferenceLayeredOracleCommitmentCarrier::OracleCommitmentEnvelope
+        );
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferenceLayeredOracleOpeningCarrier::OracleOpeningEnvelope
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleOpeningEnvelope
+        );
+        OracleCommitmentAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered statistical oracle plan should validate");
+    }
+
+    #[test]
+    fn layered_oracle_adapter_maps_perfect_oracle_to_auxiliary_envelope() {
+        let shape = OracleCommitmentShape::new(1, 2, 8, 4, 2).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::perfect(
+            shape,
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = OracleCommitmentAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleAuxiliaryWitnessEnvelope
+        );
+        OracleCommitmentAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered perfect oracle plan should validate");
+    }
+
+    #[test]
+    fn layered_oracle_adapter_detects_hidden_carrier_mismatches() {
+        let shape = OracleCommitmentShape::new(1, 2, 8, 4, 2).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::perfect(
+            shape,
+            OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let bad_plan = OracleCommitmentAdapterPlan::new(
+            SecurityLevel::Perfect,
+            ReferenceLayeredOracleCommitmentCarrier::OracleCommitmentEnvelope,
+            ReferenceLayeredOracleOpeningCarrier::OracleOpeningEnvelope,
+            ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleOpeningEnvelope,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            OracleCommitmentAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceLayeredOracleCommitmentAdapterError::HiddenCarrierMismatch {
+                    expected:
+                        ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleAuxiliaryWitnessEnvelope,
+                    observed: ReferenceLayeredOracleHiddenAuxiliaryCarrier::OracleOpeningEnvelope,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_maps_statistical_quotient_in_band() {
+        let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            shape,
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = QuotientHiderAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField
+        );
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferencePlonky3QuotientOpeningSlot::OpenedQuotientValuesField
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals
+        );
+        assert_eq!(
+            plan.decomposition_family(),
+            QuotientDecompositionFamily::DegreeChunked
+        );
+        assert_eq!(plan.query_budget(), 8);
+        QuotientHiderAdapter::validate(&adapter, &spec, &plan)
+            .expect("statistical quotient plan should validate");
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_maps_perfect_quotient_to_dedicated_field() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::perfect(
+            QuotientDecompositionFamily::Segmented,
+            6,
+            shape,
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = QuotientHiderAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3QuotientHiddenAuxiliarySlot::DedicatedQuotientWitnessField
+        );
+        QuotientHiderAdapter::validate(&adapter, &spec, &plan)
+            .expect("perfect quotient plan should validate");
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_detects_hidden_slot_mismatches() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::perfect(
+            QuotientDecompositionFamily::Segmented,
+            6,
+            shape,
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let bad_plan = QuotientHiderAdapterPlan::new(
+            SecurityLevel::Perfect,
+            QuotientDecompositionFamily::Segmented,
+            6,
+            ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField,
+            ReferencePlonky3QuotientOpeningSlot::OpenedQuotientValuesField,
+            ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            QuotientHiderAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceQuotientHiderAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected:
+                        ReferencePlonky3QuotientHiddenAuxiliarySlot::DedicatedQuotientWitnessField,
+                    observed: ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn layered_quotient_adapter_maps_statistical_quotient_to_opening_envelope() {
+        let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            shape,
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = QuotientHiderAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferenceLayeredQuotientCommitmentCarrier::QuotientCommitmentEnvelope
+        );
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferenceLayeredQuotientOpeningCarrier::QuotientOpeningEnvelope
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope
+        );
+        QuotientHiderAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered statistical quotient plan should validate");
+    }
+
+    #[test]
+    fn layered_quotient_adapter_maps_perfect_quotient_to_auxiliary_envelope() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::perfect(
+            QuotientDecompositionFamily::Segmented,
+            6,
+            shape,
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let plan = QuotientHiderAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientAuxiliaryEnvelope
+        );
+        QuotientHiderAdapter::validate(&adapter, &spec, &plan)
+            .expect("layered perfect quotient plan should validate");
+    }
+
+    #[test]
+    fn layered_quotient_adapter_detects_hidden_carrier_mismatches() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        let spec = ShroudQuotientHiderSpec::perfect(
+            QuotientDecompositionFamily::Segmented,
+            6,
+            shape,
+            QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+        )
+        .expect("valid spec");
+        let adapter = ReferenceLayeredAdapter;
+
+        let bad_plan = QuotientHiderAdapterPlan::new(
+            SecurityLevel::Perfect,
+            QuotientDecompositionFamily::Segmented,
+            6,
+            ReferenceLayeredQuotientCommitmentCarrier::QuotientCommitmentEnvelope,
+            ReferenceLayeredQuotientOpeningCarrier::QuotientOpeningEnvelope,
+            ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            QuotientHiderAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceLayeredQuotientHiderAdapterError::HiddenCarrierMismatch {
+                    expected:
+                        ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientAuxiliaryEnvelope,
+                    observed:
+                        ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope,
+                }
+            )
+        );
+    }
+}
