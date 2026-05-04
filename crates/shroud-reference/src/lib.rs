@@ -6,9 +6,10 @@
 use core::fmt;
 
 use shroud_adapter::{
-    BatchOpeningAdapter, BatchOpeningAdapterPlan, OpeningProjectionAdapter,
-    OpeningProjectionAdapterPlan, OracleCommitmentAdapter, OracleCommitmentAdapterPlan,
-    QuotientHiderAdapter, QuotientHiderAdapterPlan, proof_slot_layout,
+    BatchOpeningAdapter, BatchOpeningAdapterPlan, CodewordEmbeddingAdapter,
+    CodewordEmbeddingAdapterPlan, OpeningProjectionAdapter, OpeningProjectionAdapterPlan,
+    OracleCommitmentAdapter, OracleCommitmentAdapterPlan, QuotientHiderAdapter,
+    QuotientHiderAdapterPlan, proof_slot_layout,
 };
 use shroud_batch_opening::{
     BatchOpeningShape, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
@@ -17,7 +18,8 @@ use shroud_batch_opening::{
     PerfectRandomizerTranscript, PreparedPerfectRandomizer, ProofSlotLayout,
     RandomizerOpeningPayload, ShroudBatchOpeningSpec,
 };
-use shroud_core::TranscriptStage;
+use shroud_codeword_embedding::ShroudCodewordEmbeddingSpec;
+use shroud_core::{AuxiliaryTransport, BasisDescriptor, TranscriptStage};
 use shroud_opening_projection::{AuxiliaryOpeningTransport, ShroudOpeningProjectionSpec};
 use shroud_oracle_commitment::{OracleAuxiliaryTransport, ShroudOracleCommitmentSpec};
 use shroud_quotient_hider::{QuotientAuxiliaryTransport, ShroudQuotientHiderSpec};
@@ -187,10 +189,14 @@ pub struct ReferencePerfectRandomizerBackend {
 
 impl ReferencePerfectRandomizerBackend {
     /// Builds the SHROUD v1 preferred backend model using an encoded oracle bundle.
+    ///
+    /// Uses the supplied basis descriptor. For the standard Plonky3
+    /// `BinomialExtensionField` convention, pass
+    /// `BasisDescriptor::plonky3_binomial(extension_degree)`.
     #[must_use]
-    pub const fn encoded_oracle_bundle() -> Self {
+    pub const fn encoded_oracle_bundle(basis: BasisDescriptor) -> Self {
         Self {
-            model: PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            model: PerfectRandomizerCommitment::encoded_oracle_bundle(basis),
         }
     }
 
@@ -416,6 +422,196 @@ pub enum ReferenceLayeredQuotientHiddenAuxiliaryCarrier {
     /// Hidden quotient auxiliaries move into a dedicated auxiliary quotient envelope.
     QuotientAuxiliaryEnvelope,
 }
+
+/// Plonky3-like commitment slot for the codeword-embedding adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3CodewordCommitmentSlot {
+    /// The outer PCS commitment object (carries the committed trace+randomizer matrix).
+    TraceCommitment,
+}
+
+/// Plonky3-like slot carrying the public trace opening values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3CodewordPublicOpeningSlot {
+    /// The outer opened-values field (public trace column evaluations at OOD points).
+    OpenedTraceValues,
+}
+
+/// Plonky3-like slot carrying hidden randomizer opening material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencePlonky3CodewordHiddenAuxiliarySlot {
+    /// Hidden randomizer codeword openings embedded inside the FRI opening proof.
+    FriProofRandomCodewordOpenings,
+    /// Randomizer openings carried in a dedicated outer field (not supported by standard HidingFriPcs).
+    DedicatedCodewordAuxiliaryField,
+}
+
+/// Declared configuration of a Plonky3 `HidingFriPcs` instance.
+///
+/// `HidingFriPcs` fields are private; callers must declare the parameters they
+/// used when constructing it. The codeword-embedding adapter validates the SHROUD
+/// spec against this declared profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceHidingFriPcsProfile {
+    /// `log_blowup` passed to the FRI parameters.
+    pub log_blowup: usize,
+    /// `num_random_codewords` passed to `HidingFriPcs::new`.
+    pub num_random_codewords: usize,
+    /// Extension-field basis used by the challenge field.
+    pub basis: BasisDescriptor,
+    /// Whether the input MMCS is a hiding MMCS.
+    pub input_mmcs_hiding: bool,
+    /// Whether the FRI query-phase MMCS is a hiding MMCS.
+    pub fri_mmcs_hiding: bool,
+}
+
+impl ReferenceHidingFriPcsProfile {
+    /// Returns the standard BabyBear/BinomialExtension(4) profile used by the reference adapter.
+    ///
+    /// Matches the `HidingBackend` constants in `p3-zk-proofs`:
+    /// `log_blowup = 2`, `num_random_codewords = 4`, degree-4 binomial extension,
+    /// both MMCS layers hiding.
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            log_blowup: REFERENCE_LOG_BLOWUP,
+            num_random_codewords: REFERENCE_NUM_RANDOM_CODEWORDS,
+            basis: BasisDescriptor::plonky3_binomial(4),
+            input_mmcs_hiding: true,
+            fri_mmcs_hiding: true,
+        }
+    }
+
+    /// Validates a SHROUD codeword-embedding spec against this profile.
+    ///
+    /// Checks that both MMCS layers are hiding, the FRI blowup is sufficient,
+    /// and the number of random codewords matches the spec's required randomizer columns.
+    pub fn validate_for_spec(
+        &self,
+        spec: &ShroudCodewordEmbeddingSpec,
+    ) -> Result<(), ReferenceCodewordEmbeddingAdapterError> {
+        if !self.input_mmcs_hiding || !self.fri_mmcs_hiding {
+            return Err(ReferenceCodewordEmbeddingAdapterError::NonHidingMmcs);
+        }
+
+        let required_blowup = spec.payload().required_log_blowup();
+        if self.log_blowup < required_blowup {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::InsufficientFriBlowup {
+                    required: required_blowup,
+                    configured: self.log_blowup,
+                },
+            );
+        }
+
+        let required_randomizers = spec.payload().hidden_randomizer_columns();
+        if self.num_random_codewords != required_randomizers {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::RandomizerColumnMismatch {
+                    required: required_randomizers,
+                    configured: self.num_random_codewords,
+                },
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Error raised by the codeword-embedding adapter for `ReferencePlonky3Adapter`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceCodewordEmbeddingAdapterError {
+    /// The adapter plan fields do not match the SHROUD codeword-embedding spec.
+    PlanMismatch,
+    /// The commitment slot does not match the expected layout.
+    CommitmentSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3CodewordCommitmentSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3CodewordCommitmentSlot,
+    },
+    /// The public opening slot does not match the expected layout.
+    PublicOpeningSlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3CodewordPublicOpeningSlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3CodewordPublicOpeningSlot,
+    },
+    /// The hidden auxiliary slot does not match the expected layout.
+    HiddenAuxiliarySlotMismatch {
+        /// Slot required by the adapter.
+        expected: ReferencePlonky3CodewordHiddenAuxiliarySlot,
+        /// Slot actually supplied.
+        observed: ReferencePlonky3CodewordHiddenAuxiliarySlot,
+    },
+    /// The FRI blowup is insufficient for the required statistical hiding guarantee.
+    InsufficientFriBlowup {
+        /// Minimum blowup required by the SHROUD spec.
+        required: usize,
+        /// Blowup actually configured.
+        configured: usize,
+    },
+    /// The number of random codewords does not match the hidden randomizer column count.
+    RandomizerColumnMismatch {
+        /// Number of hidden randomizer columns required by the SHROUD spec.
+        required: usize,
+        /// Number of random codewords actually configured.
+        configured: usize,
+    },
+    /// The auxiliary transport is `SeparateEnvelope`, which is not supported by standard `HidingFriPcs`.
+    UnsupportedAuxiliaryTransport,
+    /// The profile declares a non-hiding input or FRI MMCS, which cannot provide ZK.
+    NonHidingMmcs,
+}
+
+impl fmt::Display for ReferenceCodewordEmbeddingAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanMismatch => write!(
+                f,
+                "codeword-embedding adapter plan does not match the SHROUD spec"
+            ),
+            Self::CommitmentSlotMismatch { expected, observed } => write!(
+                f,
+                "codeword commitment slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::PublicOpeningSlotMismatch { expected, observed } => write!(
+                f,
+                "codeword public opening slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::HiddenAuxiliarySlotMismatch { expected, observed } => write!(
+                f,
+                "codeword hidden auxiliary slot mismatch: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::InsufficientFriBlowup {
+                required,
+                configured,
+            } => write!(
+                f,
+                "FRI blowup {configured} is below the required minimum {required} for statistical hiding"
+            ),
+            Self::RandomizerColumnMismatch {
+                required,
+                configured,
+            } => write!(
+                f,
+                "randomizer column mismatch: SHROUD spec requires {required}, HidingFriPcs configured with {configured}"
+            ),
+            Self::UnsupportedAuxiliaryTransport => write!(
+                f,
+                "SeparateEnvelope auxiliary transport is not supported by standard HidingFriPcs; \
+                 use InBand transport for the reference Plonky3 adapter"
+            ),
+            Self::NonHidingMmcs => write!(
+                f,
+                "profile declares a non-hiding MMCS; both input_mmcs_hiding and fri_mmcs_hiding \
+                 must be true to provide zero-knowledge"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceCodewordEmbeddingAdapterError {}
 
 /// Error raised by the reference adapter surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1624,36 +1820,132 @@ impl PerfectRandomizerBackend for ReferencePerfectRandomizerBackend {
     }
 }
 
+/// Standard Plonky3 BabyBear/BinomialExtension(4) FRI blowup used by the reference adapter.
+const REFERENCE_LOG_BLOWUP: usize = 2;
+
+/// Standard Plonky3 number of random codewords used by the reference adapter.
+const REFERENCE_NUM_RANDOM_CODEWORDS: usize = 4;
+
+impl CodewordEmbeddingAdapter for ReferencePlonky3Adapter {
+    type CommitmentSlot = ReferencePlonky3CodewordCommitmentSlot;
+    type PublicOpeningSlot = ReferencePlonky3CodewordPublicOpeningSlot;
+    type HiddenAuxiliarySlot = ReferencePlonky3CodewordHiddenAuxiliarySlot;
+    type Error = ReferenceCodewordEmbeddingAdapterError;
+
+    fn plan(
+        &self,
+        spec: &ShroudCodewordEmbeddingSpec,
+    ) -> Result<
+        CodewordEmbeddingAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+        Self::Error,
+    > {
+        if spec.auxiliary_transport() == AuxiliaryTransport::SeparateEnvelope {
+            return Err(ReferenceCodewordEmbeddingAdapterError::UnsupportedAuxiliaryTransport);
+        }
+
+        Ok(CodewordEmbeddingAdapterPlan::new(
+            spec.security_level(),
+            ReferencePlonky3CodewordCommitmentSlot::TraceCommitment,
+            ReferencePlonky3CodewordPublicOpeningSlot::OpenedTraceValues,
+            ReferencePlonky3CodewordHiddenAuxiliarySlot::FriProofRandomCodewordOpenings,
+            spec.payload(),
+        ))
+    }
+
+    fn validate(
+        &self,
+        spec: &ShroudCodewordEmbeddingSpec,
+        plan: &CodewordEmbeddingAdapterPlan<
+            Self::CommitmentSlot,
+            Self::PublicOpeningSlot,
+            Self::HiddenAuxiliarySlot,
+        >,
+    ) -> Result<(), Self::Error> {
+        if spec.auxiliary_transport() == AuxiliaryTransport::SeparateEnvelope {
+            return Err(ReferenceCodewordEmbeddingAdapterError::UnsupportedAuxiliaryTransport);
+        }
+
+        if *plan.commitment_slot() != ReferencePlonky3CodewordCommitmentSlot::TraceCommitment {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::CommitmentSlotMismatch {
+                    expected: ReferencePlonky3CodewordCommitmentSlot::TraceCommitment,
+                    observed: *plan.commitment_slot(),
+                },
+            );
+        }
+
+        if *plan.public_opening_slot()
+            != ReferencePlonky3CodewordPublicOpeningSlot::OpenedTraceValues
+        {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::PublicOpeningSlotMismatch {
+                    expected: ReferencePlonky3CodewordPublicOpeningSlot::OpenedTraceValues,
+                    observed: *plan.public_opening_slot(),
+                },
+            );
+        }
+
+        if *plan.hidden_auxiliary_slot()
+            != ReferencePlonky3CodewordHiddenAuxiliarySlot::FriProofRandomCodewordOpenings
+        {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected:
+                        ReferencePlonky3CodewordHiddenAuxiliarySlot::FriProofRandomCodewordOpenings,
+                    observed: *plan.hidden_auxiliary_slot(),
+                },
+            );
+        }
+
+        ReferenceHidingFriPcsProfile::standard().validate_for_spec(spec)?;
+
+        if plan.security_level() != spec.security_level() || plan.payload() != spec.payload() {
+            return Err(ReferenceCodewordEmbeddingAdapterError::PlanMismatch);
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ReferenceAdapterError, ReferenceLayeredAdapter, ReferenceLayeredAdapterError,
-        ReferenceLayeredCommitmentCarrier, ReferenceLayeredHiddenAuxiliaryCarrier,
-        ReferenceLayeredOracleCommitmentAdapterError, ReferenceLayeredOracleCommitmentCarrier,
-        ReferenceLayeredOracleHiddenAuxiliaryCarrier, ReferenceLayeredOracleOpeningCarrier,
-        ReferenceLayeredProjectionAdapterError, ReferenceLayeredPublicOpeningCarrier,
-        ReferenceLayeredQuotientCommitmentCarrier, ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
-        ReferenceLayeredQuotientHiderAdapterError, ReferenceLayeredQuotientOpeningCarrier,
-        ReferenceOracleCommitmentAdapterError, ReferencePerfectRandomizerBackend,
-        ReferencePerfectRandomizerError, ReferencePlonky3Adapter, ReferencePlonky3CommitmentSlot,
-        ReferencePlonky3HiddenAuxiliarySlot, ReferencePlonky3OracleCommitmentSlot,
-        ReferencePlonky3OracleHiddenAuxiliarySlot, ReferencePlonky3OracleOpeningSlot,
-        ReferencePlonky3PublicOpeningSlot, ReferencePlonky3QuotientCommitmentSlot,
-        ReferencePlonky3QuotientHiddenAuxiliarySlot, ReferencePlonky3QuotientOpeningSlot,
-        ReferenceProjectionAdapterError, ReferenceQuotientHiderAdapterError, ReferenceTranscript,
-        ReferenceTranscriptError,
+        REFERENCE_LOG_BLOWUP, REFERENCE_NUM_RANDOM_CODEWORDS, ReferenceAdapterError,
+        ReferenceCodewordEmbeddingAdapterError, ReferenceHidingFriPcsProfile,
+        ReferenceLayeredAdapter, ReferenceLayeredAdapterError, ReferenceLayeredCommitmentCarrier,
+        ReferenceLayeredHiddenAuxiliaryCarrier, ReferenceLayeredOracleCommitmentAdapterError,
+        ReferenceLayeredOracleCommitmentCarrier, ReferenceLayeredOracleHiddenAuxiliaryCarrier,
+        ReferenceLayeredOracleOpeningCarrier, ReferenceLayeredProjectionAdapterError,
+        ReferenceLayeredPublicOpeningCarrier, ReferenceLayeredQuotientCommitmentCarrier,
+        ReferenceLayeredQuotientHiddenAuxiliaryCarrier, ReferenceLayeredQuotientHiderAdapterError,
+        ReferenceLayeredQuotientOpeningCarrier, ReferenceOracleCommitmentAdapterError,
+        ReferencePerfectRandomizerBackend, ReferencePerfectRandomizerError,
+        ReferencePlonky3Adapter, ReferencePlonky3CodewordCommitmentSlot,
+        ReferencePlonky3CodewordHiddenAuxiliarySlot, ReferencePlonky3CodewordPublicOpeningSlot,
+        ReferencePlonky3CommitmentSlot, ReferencePlonky3HiddenAuxiliarySlot,
+        ReferencePlonky3OracleCommitmentSlot, ReferencePlonky3OracleHiddenAuxiliarySlot,
+        ReferencePlonky3OracleOpeningSlot, ReferencePlonky3PublicOpeningSlot,
+        ReferencePlonky3QuotientCommitmentSlot, ReferencePlonky3QuotientHiddenAuxiliarySlot,
+        ReferencePlonky3QuotientOpeningSlot, ReferenceProjectionAdapterError,
+        ReferenceQuotientHiderAdapterError, ReferenceTranscript, ReferenceTranscriptError,
     };
     use shroud_adapter::{
-        BatchOpeningAdapter, BatchOpeningAdapterPlan, OpeningProjectionAdapter,
-        OpeningProjectionAdapterPlan, OracleCommitmentAdapter, OracleCommitmentAdapterPlan,
-        QuotientHiderAdapter, QuotientHiderAdapterPlan,
+        BatchOpeningAdapter, BatchOpeningAdapterPlan, CodewordEmbeddingAdapter,
+        CodewordEmbeddingAdapterPlan, OpeningProjectionAdapter, OpeningProjectionAdapterPlan,
+        OracleCommitmentAdapter, OracleCommitmentAdapterPlan, QuotientHiderAdapter,
+        QuotientHiderAdapterPlan,
     };
     use shroud_batch_opening::{
         BatchOpeningShape, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
         PerfectRandomizerAdapter, PerfectRandomizerBackend, PerfectRandomizerCommitment,
         PerfectRandomizerReconstruction, ProofSlotLayout, ShroudBatchOpeningSpec,
     };
-    use shroud_core::{SecurityLevel, TranscriptStage};
+    use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
+    use shroud_core::{AuxiliaryTransport, BasisDescriptor, SecurityLevel, TranscriptStage};
     use shroud_opening_projection::{
         AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
     };
@@ -1686,7 +1978,9 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             15,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                2,
+            )),
         )
         .expect("valid spec");
         let mut transcript = ReferenceTranscript::new(&spec);
@@ -1716,10 +2010,14 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             31,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                3,
+            )),
         )
         .expect("valid spec");
-        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle();
+        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(3),
+        );
         let prepared = backend.commit(&spec).expect("commit should succeed");
 
         let mut transcript = ReferenceTranscript::new(&spec);
@@ -1750,7 +2048,9 @@ mod tests {
 
         assert_eq!(
             reconstruction.commitment(),
-            PerfectRandomizerCommitment::encoded_oracle_bundle()
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                3
+            ))
         );
         assert_eq!(
             reconstruction.opening_payload().proof_slot_layout(),
@@ -1804,12 +2104,16 @@ mod tests {
             PerfectRandomizerCommitment::native_extension_pcs(),
         )
         .expect("valid spec");
-        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle();
+        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(2),
+        );
 
         assert_eq!(
             backend.commit(&spec),
             Err(ReferencePerfectRandomizerError::CommitmentModelMismatch {
-                expected: PerfectRandomizerCommitment::encoded_oracle_bundle(),
+                expected: PerfectRandomizerCommitment::encoded_oracle_bundle(
+                    BasisDescriptor::plonky3_binomial(2),
+                ),
                 observed: PerfectRandomizerCommitment::native_extension_pcs(),
             })
         );
@@ -1821,7 +2125,9 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             31,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                3,
+            )),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -1842,7 +2148,9 @@ mod tests {
         assert_eq!(
             reconstruction,
             PerfectRandomizerReconstruction::new(
-                PerfectRandomizerCommitment::encoded_oracle_bundle(),
+                PerfectRandomizerCommitment::encoded_oracle_bundle(
+                    BasisDescriptor::plonky3_binomial(3),
+                ),
                 surface.opening_payload(),
             )
         );
@@ -1954,7 +2262,9 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             15,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                2,
+            )),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2003,7 +2313,9 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             15,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                2,
+            )),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2500,6 +2812,166 @@ mod tests {
                         ReferenceLayeredQuotientHiddenAuxiliaryCarrier::QuotientOpeningEnvelope,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn codeword_embedding_adapter_maps_statistical_spec_to_standard_slots() {
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let shape = CodewordEmbeddingShape::new(
+            64,
+            profile.num_random_codewords,
+            18,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = CodewordEmbeddingAdapter::plan(&adapter, &spec).expect("plan should succeed");
+
+        assert_eq!(plan.security_level(), SecurityLevel::Statistical);
+        assert_eq!(
+            plan.commitment_slot(),
+            &ReferencePlonky3CodewordCommitmentSlot::TraceCommitment
+        );
+        assert_eq!(
+            plan.public_opening_slot(),
+            &ReferencePlonky3CodewordPublicOpeningSlot::OpenedTraceValues
+        );
+        assert_eq!(
+            plan.hidden_auxiliary_slot(),
+            &ReferencePlonky3CodewordHiddenAuxiliarySlot::FriProofRandomCodewordOpenings
+        );
+        assert_eq!(plan.payload().required_log_blowup(), profile.log_blowup);
+        assert_eq!(
+            plan.payload().hidden_randomizer_columns(),
+            profile.num_random_codewords
+        );
+        assert_eq!(plan.payload().public_trace_columns(), 64);
+        CodewordEmbeddingAdapter::validate(&adapter, &spec, &plan)
+            .expect("standard statistical plan should validate");
+    }
+
+    #[test]
+    fn codeword_embedding_adapter_rejects_separate_envelope_transport() {
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let shape = CodewordEmbeddingShape::new(
+            64,
+            profile.num_random_codewords,
+            18,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical_with_transport(
+            shape,
+            AuxiliaryTransport::SeparateEnvelope,
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        assert_eq!(
+            CodewordEmbeddingAdapter::plan(&adapter, &spec),
+            Err(ReferenceCodewordEmbeddingAdapterError::UnsupportedAuxiliaryTransport)
+        );
+    }
+
+    #[test]
+    fn codeword_embedding_adapter_rejects_wrong_randomizer_count() {
+        let wrong_randomizers = REFERENCE_NUM_RANDOM_CODEWORDS + 1;
+        let shape = CodewordEmbeddingShape::new(64, wrong_randomizers, 18, wrong_randomizers)
+            .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let plan = CodewordEmbeddingAdapter::plan(&adapter, &spec).expect("plan should succeed");
+        assert_eq!(
+            CodewordEmbeddingAdapter::validate(&adapter, &spec, &plan),
+            Err(
+                ReferenceCodewordEmbeddingAdapterError::RandomizerColumnMismatch {
+                    required: wrong_randomizers,
+                    configured: REFERENCE_NUM_RANDOM_CODEWORDS,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn codeword_embedding_adapter_rejects_wrong_hidden_slot() {
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let shape = CodewordEmbeddingShape::new(
+            64,
+            profile.num_random_codewords,
+            18,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        let bad_plan = CodewordEmbeddingAdapterPlan::new(
+            SecurityLevel::Statistical,
+            ReferencePlonky3CodewordCommitmentSlot::TraceCommitment,
+            ReferencePlonky3CodewordPublicOpeningSlot::OpenedTraceValues,
+            ReferencePlonky3CodewordHiddenAuxiliarySlot::DedicatedCodewordAuxiliaryField,
+            spec.payload(),
+        );
+
+        assert_eq!(
+            CodewordEmbeddingAdapter::validate(&adapter, &spec, &bad_plan),
+            Err(
+                ReferenceCodewordEmbeddingAdapterError::HiddenAuxiliarySlotMismatch {
+                    expected:
+                        ReferencePlonky3CodewordHiddenAuxiliarySlot::FriProofRandomCodewordOpenings,
+                    observed:
+                        ReferencePlonky3CodewordHiddenAuxiliarySlot::DedicatedCodewordAuxiliaryField,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn hiding_fri_pcs_profile_standard_matches_adapter_constants() {
+        let profile = ReferenceHidingFriPcsProfile::standard();
+
+        assert_eq!(profile.log_blowup, REFERENCE_LOG_BLOWUP);
+        assert_eq!(profile.num_random_codewords, REFERENCE_NUM_RANDOM_CODEWORDS);
+        assert_eq!(profile.basis, BasisDescriptor::plonky3_binomial(4));
+        assert!(profile.input_mmcs_hiding);
+        assert!(profile.fri_mmcs_hiding);
+
+        let shape = CodewordEmbeddingShape::new(
+            8,
+            profile.num_random_codewords,
+            profile.log_blowup + 1,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+
+        profile
+            .validate_for_spec(&spec)
+            .expect("standard profile should accept matching spec");
+    }
+
+    #[test]
+    fn profile_validate_for_spec_rejects_non_hiding_mmcs() {
+        let profile = ReferenceHidingFriPcsProfile {
+            input_mmcs_hiding: false,
+            ..ReferenceHidingFriPcsProfile::standard()
+        };
+        let shape = CodewordEmbeddingShape::new(
+            8,
+            profile.num_random_codewords,
+            profile.log_blowup + 1,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+
+        assert_eq!(
+            profile.validate_for_spec(&spec),
+            Err(ReferenceCodewordEmbeddingAdapterError::NonHidingMmcs)
         );
     }
 }

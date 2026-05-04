@@ -5,5 +5,8 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lib]
 path = "src/lib.rs"

@@ -364,6 +364,39 @@ impl fmt::Display for CodewordEmbeddingError {
 impl std::error::Error for CodewordEmbeddingError {}
 
 #[cfg(test)]
+mod proptests {
+    use super::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn committed_columns_always_equals_trace_plus_randomizer(
+            trace in 1usize..256,
+            ext in 1usize..16,
+            domain in 1usize..24,
+        ) {
+            let shape = CodewordEmbeddingShape::new(trace, ext, domain, ext).expect("valid shape");
+            let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+            prop_assert_eq!(spec.payload().committed_columns(), trace + ext);
+            prop_assert_eq!(spec.payload().public_trace_columns(), trace);
+            prop_assert_eq!(spec.payload().hidden_randomizer_columns(), ext);
+        }
+
+        #[test]
+        fn statistical_spec_rejects_when_randomizer_differs_from_extension(
+            trace in 1usize..256,
+            rand in 1usize..16,
+            ext in 1usize..16,
+            domain in 1usize..24,
+        ) {
+            prop_assume!(rand != ext);
+            let shape = CodewordEmbeddingShape::new(trace, rand, domain, ext).expect("valid shape");
+            prop_assert!(ShroudCodewordEmbeddingSpec::statistical(shape).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         AuxiliaryTransport, CodewordEmbeddingError, CodewordEmbeddingShape,

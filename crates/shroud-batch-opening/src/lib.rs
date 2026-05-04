@@ -13,7 +13,8 @@
 use core::fmt;
 
 use shroud_core::{
-    DegreeBudget, DegreeBudgetError, SecurityLevel, TranscriptPlan, TranscriptPlanError,
+    BasisDescriptor, DegreeBudget, DegreeBudgetError, SecurityLevel, TranscriptPlan,
+    TranscriptPlanError,
 };
 
 /// Statement shape for a reduced batch-opening relation.
@@ -134,8 +135,13 @@ pub enum PerfectRandomizerRealization {
     ///
     /// This is not “native extension support.” It is the SHROUD v1 path where a
     /// backend reuses its existing oracle path while still treating the encoded
-    /// bundle as one exact randomizer object.
-    EncodedOracleBundle,
+    /// bundle as one exact randomizer object. The `basis` descriptor makes the
+    /// encoding self-describing so an auditor can verify the backend's
+    /// `reconstitute_from_base` convention without relying on implicit field assumptions.
+    EncodedOracleBundle {
+        /// Self-describing basis for flattening and reconstructing the randomizer.
+        basis: BasisDescriptor,
+    },
     /// A native extension-field PCS or equivalent extension-aware backend.
     NativeExtensionPcs,
 }
@@ -478,13 +484,17 @@ pub struct PerfectRandomizerCommitment {
 impl PerfectRandomizerCommitment {
     /// Preferred SHROUD v1 realization: exact encoding into the existing oracle backend.
     ///
+    /// The `basis` descriptor makes the encoding self-describing. Use
+    /// `BasisDescriptor::plonky3_binomial(extension_degree)` for the standard
+    /// Plonky3 `BinomialExtensionField` convention.
+    ///
     /// This remains a perfect-variant commitment model only if the backend can
     /// justify that the encoded coordinates represent the same exact
     /// extension-field randomizer that the protocol reasons about.
     #[must_use]
-    pub const fn encoded_oracle_bundle() -> Self {
+    pub const fn encoded_oracle_bundle(basis: BasisDescriptor) -> Self {
         Self {
-            realization: PerfectRandomizerRealization::EncodedOracleBundle,
+            realization: PerfectRandomizerRealization::EncodedOracleBundle { basis },
             proof_slot_layout: ProofSlotLayout::ReuseCurrentRandomSlot,
         }
     }
@@ -517,16 +527,18 @@ impl PerfectRandomizerCommitment {
         shape: BatchOpeningShape,
     ) -> PerfectRandomizerOpeningPayload {
         match self.realization {
-            PerfectRandomizerRealization::EncodedOracleBundle => PerfectRandomizerOpeningPayload {
-                public_extension_evaluations: shape.opening_points(),
-                hidden_payload: PerfectHiddenOpeningPayload::EncodedCoordinates {
-                    base_field_coordinate_evaluations: shape
-                        .opening_points()
-                        .saturating_mul(shape.extension_degree()),
-                    transport: HiddenOpeningTransport::InBandWithMainOpeningProof,
-                },
-                proof_slot_layout: self.proof_slot_layout,
-            },
+            PerfectRandomizerRealization::EncodedOracleBundle { basis } => {
+                PerfectRandomizerOpeningPayload {
+                    public_extension_evaluations: shape.opening_points(),
+                    hidden_payload: PerfectHiddenOpeningPayload::EncodedCoordinates {
+                        base_field_coordinate_evaluations: shape
+                            .opening_points()
+                            .saturating_mul(basis.extension_degree),
+                        transport: HiddenOpeningTransport::InBandWithMainOpeningProof,
+                    },
+                    proof_slot_layout: self.proof_slot_layout,
+                }
+            }
             PerfectRandomizerRealization::NativeExtensionPcs => PerfectRandomizerOpeningPayload {
                 public_extension_evaluations: shape.opening_points(),
                 hidden_payload: PerfectHiddenOpeningPayload::BackendProofOnly {
@@ -708,6 +720,19 @@ impl ShroudBatchOpeningSpec {
             return Err(BatchOpeningSpecError::PerfectVariantNeedsDedicatedAuxiliaryBoundary);
         }
 
+        if let RandomizerSpec::Perfect(commitment) = self.randomizer
+            && let PerfectRandomizerRealization::EncodedOracleBundle { basis } =
+                commitment.realization()
+        {
+            let shape_degree = self.shape.extension_degree();
+            if basis.extension_degree != shape_degree {
+                return Err(BatchOpeningSpecError::InconsistentEncodedBundleDegree {
+                    shape_degree,
+                    basis_degree: basis.extension_degree,
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -727,6 +752,13 @@ pub enum BatchOpeningSpecError {
     Transcript(TranscriptPlanError),
     /// The perfect variant must use a dedicated auxiliary commitment boundary.
     PerfectVariantNeedsDedicatedAuxiliaryBoundary,
+    /// For `EncodedOracleBundle`, the basis extension degree must match the shape.
+    InconsistentEncodedBundleDegree {
+        /// Extension degree declared in `BatchOpeningShape`.
+        shape_degree: usize,
+        /// Extension degree declared in `BasisDescriptor`.
+        basis_degree: usize,
+    },
 }
 
 impl fmt::Display for BatchOpeningSpecError {
@@ -756,6 +788,15 @@ impl fmt::Display for BatchOpeningSpecError {
                 f,
                 "perfect batch-opening variants must use a dedicated auxiliary commitment boundary"
             ),
+            Self::InconsistentEncodedBundleDegree {
+                shape_degree,
+                basis_degree,
+            } => write!(
+                f,
+                "encoded-bundle basis extension degree ({basis_degree}) does not match \
+                 batch-opening shape extension degree ({shape_degree}); \
+                 the basis must describe the same field as the opening domain"
+            ),
         }
     }
 }
@@ -775,13 +816,100 @@ impl From<TranscriptPlanError> for BatchOpeningSpecError {
 }
 
 #[cfg(test)]
+mod proptests {
+    use super::{
+        BatchOpeningShape, PerfectHiddenOpeningPayload, PerfectRandomizerCommitment,
+        RandomizerOpeningPayload, ShroudBatchOpeningSpec,
+    };
+    use proptest::prelude::*;
+    use shroud_core::BasisDescriptor;
+
+    proptest! {
+        #[test]
+        fn statistical_hidden_evals_equal_points_times_extension_degree(
+            committed in 1usize..64,
+            points in 1usize..16,
+            ext in 1usize..8,
+            relation in 1usize..128,
+        ) {
+            let shape = BatchOpeningShape::new(committed, points, ext).expect("valid shape");
+            let spec = ShroudBatchOpeningSpec::statistical(shape, relation).expect("valid spec");
+            match spec.randomizer_opening_payload() {
+                RandomizerOpeningPayload::Statistical(payload) => {
+                    prop_assert_eq!(
+                        payload.hidden_base_field_coordinate_evaluations(),
+                        points * ext
+                    );
+                    prop_assert_eq!(payload.public_extension_evaluations(), points);
+                }
+                RandomizerOpeningPayload::Perfect(_) => {
+                    prop_assert!(false, "expected statistical payload")
+                }
+            }
+        }
+
+        #[test]
+        fn encoded_bundle_coordinate_evals_equal_points_times_extension_degree(
+            committed in 1usize..64,
+            points in 1usize..16,
+            ext in 1usize..8,
+            relation in 1usize..128,
+        ) {
+            let shape = BatchOpeningShape::new(committed, points, ext).expect("valid shape");
+            let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+                BasisDescriptor::plonky3_binomial(ext),
+            );
+            let spec = ShroudBatchOpeningSpec::perfect(shape, relation, commitment)
+                .expect("valid spec");
+            match spec.randomizer_opening_payload() {
+                RandomizerOpeningPayload::Perfect(payload) => {
+                    prop_assert_eq!(payload.public_extension_evaluations(), points);
+                    match payload.hidden_payload() {
+                        PerfectHiddenOpeningPayload::EncodedCoordinates {
+                            base_field_coordinate_evaluations,
+                            ..
+                        } => {
+                            prop_assert_eq!(base_field_coordinate_evaluations, points * ext);
+                        }
+                        PerfectHiddenOpeningPayload::BackendProofOnly { .. } => {
+                            prop_assert!(false, "expected encoded coordinates")
+                        }
+                    }
+                }
+                RandomizerOpeningPayload::Statistical(_) => {
+                    prop_assert!(false, "expected perfect payload")
+                }
+            }
+        }
+
+        #[test]
+        fn inconsistent_encoded_bundle_degree_always_rejected(
+            committed in 1usize..64,
+            points in 1usize..16,
+            shape_ext in 1usize..8,
+            basis_ext in 1usize..8,
+            relation in 1usize..128,
+        ) {
+            prop_assume!(shape_ext != basis_ext);
+            let shape = BatchOpeningShape::new(committed, points, shape_ext).expect("valid shape");
+            let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+                BasisDescriptor::plonky3_binomial(basis_ext),
+            );
+            prop_assert!(
+                ShroudBatchOpeningSpec::perfect(shape, relation, commitment).is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        BatchOpeningShape, CommitmentBoundary, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
-        PerfectRandomizerCommitment, PerfectRandomizerRealization, ProofSlotLayout,
-        RandomizerOpeningPayload, RandomizerSpec, ShroudBatchOpeningSpec,
+        BatchOpeningShape, BatchOpeningSpecError, CommitmentBoundary, HiddenOpeningTransport,
+        PerfectHiddenOpeningPayload, PerfectRandomizerCommitment, PerfectRandomizerRealization,
+        ProofSlotLayout, RandomizerOpeningPayload, RandomizerSpec, ShroudBatchOpeningSpec,
     };
-    use shroud_core::{DegreeBudget, SecurityLevel};
+    use shroud_core::{BasisDescriptor, DegreeBudget, SecurityLevel};
 
     #[test]
     fn statistical_spec_tracks_coordinate_polynomials_from_extension_degree() {
@@ -820,7 +948,9 @@ mod tests {
     #[test]
     fn perfect_spec_uses_dedicated_auxiliary_boundary() {
         let shape = BatchOpeningShape::new(6, 1, 2).expect("valid shape");
-        let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle();
+        let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(2),
+        );
         let spec = ShroudBatchOpeningSpec::perfect(shape, 15, commitment).expect("valid spec");
 
         assert_eq!(spec.security_level(), SecurityLevel::Perfect);
@@ -833,7 +963,9 @@ mod tests {
             RandomizerSpec::Perfect(model) => {
                 assert_eq!(
                     model.realization(),
-                    PerfectRandomizerRealization::EncodedOracleBundle
+                    PerfectRandomizerRealization::EncodedOracleBundle {
+                        basis: BasisDescriptor::plonky3_binomial(2),
+                    }
                 );
                 assert_eq!(
                     model.proof_slot_layout(),
@@ -907,10 +1039,31 @@ mod tests {
         let spec = ShroudBatchOpeningSpec::perfect_with_degree_budget(
             shape,
             budget,
-            PerfectRandomizerCommitment::encoded_oracle_bundle(),
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                2,
+            )),
         )
         .expect("valid spec");
 
         assert_eq!(spec.degree_budget(), budget);
+    }
+
+    #[test]
+    fn rejects_encoded_bundle_with_mismatched_extension_degree() {
+        // shape says degree 4 but basis says degree 2 — must be rejected.
+        let shape = BatchOpeningShape::new(4, 1, 4).expect("valid shape");
+        assert_eq!(
+            ShroudBatchOpeningSpec::perfect(
+                shape,
+                15,
+                PerfectRandomizerCommitment::encoded_oracle_bundle(
+                    BasisDescriptor::plonky3_binomial(2),
+                ),
+            ),
+            Err(BatchOpeningSpecError::InconsistentEncodedBundleDegree {
+                shape_degree: 4,
+                basis_degree: 2,
+            })
+        );
     }
 }

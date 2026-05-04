@@ -579,6 +579,30 @@ pub const fn proof_slot_layout(payload: RandomizerOpeningPayload) -> ProofSlotLa
 }
 
 #[cfg(test)]
+mod proptests {
+    use super::BatchOpeningAdapterPlan;
+    use proptest::prelude::*;
+    use shroud_batch_opening::{BatchOpeningShape, CommitmentBoundary, ShroudBatchOpeningSpec};
+    use shroud_core::SecurityLevel;
+
+    proptest! {
+        #[test]
+        fn plan_accepts_all_blowup_values_at_least_two(blowup in 2usize..100) {
+            let shape = BatchOpeningShape::new(4, 2, 3).expect("valid shape");
+            let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+            let plan = BatchOpeningAdapterPlan::new(
+                SecurityLevel::Statistical,
+                CommitmentBoundary::SharedPcsHook,
+                "slot",
+                spec.randomizer_opening_payload(),
+                blowup,
+            );
+            prop_assert_eq!(plan.required_log_blowup(), blowup);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BatchOpeningAdapterPlan, CodewordEmbeddingAdapterPlan, OpeningProjectionAdapterPlan,

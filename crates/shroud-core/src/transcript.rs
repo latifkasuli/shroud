@@ -95,13 +95,13 @@ impl TranscriptPlan {
             }
             seen[ordinal] = true;
 
-            if let Some(previous_stage) = previous {
-                if ordinal < previous_stage.ordinal() {
-                    return Err(TranscriptPlanError::OutOfOrder {
-                        previous: previous_stage,
-                        observed: *stage,
-                    });
-                }
+            if let Some(previous_stage) = previous
+                && ordinal < previous_stage.ordinal()
+            {
+                return Err(TranscriptPlanError::OutOfOrder {
+                    previous: previous_stage,
+                    observed: *stage,
+                });
             }
 
             previous = Some(*stage);
@@ -154,6 +154,35 @@ impl fmt::Display for TranscriptPlanError {
 }
 
 impl std::error::Error for TranscriptPlanError {}
+
+#[cfg(test)]
+mod proptests {
+    use super::{TranscriptPlan, TranscriptStage};
+    use proptest::prelude::*;
+
+    fn canonical_stages() -> Vec<TranscriptStage> {
+        vec![
+            TranscriptStage::ObserveMainCommitments,
+            TranscriptStage::SampleBatchingChallenge,
+            TranscriptStage::ObserveQuotientCommitments,
+            TranscriptStage::ObserveRandomizerCommitment,
+            TranscriptStage::SampleOodPoint,
+            TranscriptStage::ObservePublicOpenings,
+            TranscriptStage::ProveMaskedRelation,
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn any_transposition_of_canonical_stages_is_invalid(i in 0usize..7, j in 0usize..7) {
+            prop_assume!(i != j);
+            let mut stages = canonical_stages();
+            stages.swap(i, j);
+            let plan = TranscriptPlan { stages };
+            prop_assert!(plan.validate().is_err());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

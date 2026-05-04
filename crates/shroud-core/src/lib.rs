@@ -9,7 +9,8 @@ mod surface;
 mod transcript;
 
 pub use claim::{
-    FieldModel, PerfectClaim, PerfectClaimError, RandomnessModel, SimulatorObligations,
+    BasisDescriptor, CoordinateOrder, FieldModel, PerfectClaim, PerfectClaimError, RandomnessModel,
+    ReconstructionRule, SimulatorObligations,
 };
 pub use degree::{DegreeBudget, DegreeBudgetError};
 pub use surface::{AuxiliaryTransport, HiddenAuxiliarySurface, PublicSurface, QueryBudget};

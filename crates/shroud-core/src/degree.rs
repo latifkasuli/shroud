@@ -87,6 +87,35 @@ impl fmt::Display for DegreeBudgetError {
 impl std::error::Error for DegreeBudgetError {}
 
 #[cfg(test)]
+mod proptests {
+    use super::DegreeBudget;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn accepts_all_valid_budgets_and_computes_masked_degree(
+            relation in 0usize..1024,
+            randomizer in 0usize..1025,
+        ) {
+            prop_assume!(randomizer <= relation.saturating_add(1));
+            let budget = DegreeBudget::new(relation, randomizer).expect("valid budget");
+            let expected_masked = relation.max(randomizer.saturating_sub(1));
+            prop_assert_eq!(budget.masked_relation_degree_bound(), expected_masked);
+            prop_assert!(budget.preserves_relation_degree());
+        }
+
+        #[test]
+        fn rejects_all_violating_randomizer_degrees(
+            relation in 0usize..1024,
+            randomizer in 0usize..2048,
+        ) {
+            prop_assume!(randomizer > relation.saturating_add(1));
+            prop_assert!(DegreeBudget::new(relation, randomizer).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{DegreeBudget, DegreeBudgetError};
 

@@ -8,5 +8,8 @@ version.workspace = true
 [dependencies]
 shroud-core = { path = "../shroud-core" }
 
+[dev-dependencies]
+proptest = "1"
+
 [lib]
 path = "src/lib.rs"
