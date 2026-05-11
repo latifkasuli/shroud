@@ -21,8 +21,9 @@ use shroud_batch_opening::{
 use shroud_codeword_embedding::ShroudCodewordEmbeddingSpec;
 use shroud_core::{
     AuxiliaryTransport, BasisDescriptor, DOMAIN_PROFILE, DOMAIN_RANDOMIZER_COMMITMENT,
-    HidingTechniqueClaim, TranscriptBindable, TranscriptBinding, TranscriptBindingError,
-    TranscriptBindingManifest, TranscriptStage,
+    HashIdentifier, HidingTechniqueClaim, SampledChallenge, TranscriptBindable, TranscriptBinding,
+    TranscriptBindingError, TranscriptBindingManifest, TranscriptChallengeDeriver, TranscriptStage,
+    transcript_stage_discriminant,
 };
 use shroud_opening_projection::{AuxiliaryOpeningTransport, ShroudOpeningProjectionSpec};
 use shroud_oracle_commitment::{OracleAuxiliaryTransport, ShroudOracleCommitmentSpec};
@@ -35,6 +36,7 @@ pub struct ReferenceTranscript<'a> {
     cursor: usize,
     record: ReferenceBindingRecord,
     manifest: TranscriptBindingManifest,
+    challenges: Vec<ReferenceSampledChallenge>,
 }
 
 impl<'a> ReferenceTranscript<'a> {
@@ -52,6 +54,7 @@ impl<'a> ReferenceTranscript<'a> {
             cursor: 0,
             record: ReferenceBindingRecord::new(),
             manifest,
+            challenges: Vec::new(),
         }
     }
 
@@ -105,10 +108,125 @@ impl<'a> ReferenceTranscript<'a> {
         }
     }
 
-    /// Returns `true` when the transcript has consumed the full plan.
+    /// Samples and records a Fiat-Shamir challenge at the current sampling stage.
+    pub fn sample_challenge<D: TranscriptChallengeDeriver>(
+        &mut self,
+        stage: TranscriptStage,
+        deriver: &D,
+    ) -> Result<SampledChallenge, ReferenceTranscriptError> {
+        self.advance(stage)?;
+        let absorbed_len = self.record.absorbed().len();
+        let challenge = deriver.derive_challenge(self.record.absorbed(), stage);
+        self.challenges.push(ReferenceSampledChallenge {
+            challenge: challenge.clone(),
+            absorbed_len,
+        });
+        Ok(challenge)
+    }
+
+    /// Replays every sampled challenge against the absorbed binding prefix used
+    /// when it was sampled.
+    pub fn replay_challenges<D: TranscriptChallengeDeriver>(
+        &self,
+        deriver: &D,
+    ) -> Result<(), ReferenceTranscriptError> {
+        for recorded in &self.challenges {
+            let expected = deriver.derive_challenge(
+                &self.record.absorbed()[..recorded.absorbed_len],
+                recorded.challenge.stage(),
+            );
+            if expected != recorded.challenge {
+                return Err(ReferenceTranscriptError::ChallengeReplayMismatch {
+                    stage: recorded.challenge.stage(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Consumes the transcript, verifies completion, validates the manifest, and
+    /// replays all sampled challenges.
+    pub fn finish<D: TranscriptChallengeDeriver>(
+        self,
+        deriver: &D,
+    ) -> Result<ReferenceBindingRecord, ReferenceTranscriptError> {
+        if self.cursor != self.spec.transcript_plan().stages().len() {
+            return Err(ReferenceTranscriptError::IncompleteTranscript {
+                next_stage: self.expected_stage(),
+            });
+        }
+        self.record
+            .finalize(&self.manifest)
+            .map_err(ReferenceTranscriptError::BindingFinalization)?;
+        self.replay_challenges(deriver)?;
+        self.require_logged_sampling_challenges()?;
+        Ok(self.record)
+    }
+
+    fn require_logged_sampling_challenges(&self) -> Result<(), ReferenceTranscriptError> {
+        for stage in [
+            TranscriptStage::SampleBatchingChallenge,
+            TranscriptStage::SampleOodPoint,
+        ] {
+            if !self
+                .challenges
+                .iter()
+                .any(|recorded| recorded.challenge.stage() == stage)
+            {
+                return Err(ReferenceTranscriptError::MissingSampledChallenge { stage });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReferenceSampledChallenge {
+    challenge: SampledChallenge,
+    absorbed_len: usize,
+}
+
+/// Deterministic reference challenge deriver for replay tests.
+///
+/// This is not a cryptographic hash. A real backend bridge must implement
+/// [`TranscriptChallengeDeriver`] using its production Fiat-Shamir transcript.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceChallengeDeriver {
+    hash_identifier: HashIdentifier,
+}
+
+impl ReferenceChallengeDeriver {
+    /// Creates a reference challenge deriver from a hash-suite identifier.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.cursor == self.spec.transcript_plan().stages().len()
+    pub fn new(hash_identifier: HashIdentifier) -> Self {
+        Self { hash_identifier }
+    }
+}
+
+impl TranscriptChallengeDeriver for ReferenceChallengeDeriver {
+    fn hash_identifier(&self) -> HashIdentifier {
+        self.hash_identifier.clone()
+    }
+
+    fn derive_challenge(
+        &self,
+        absorbed_prefix: &[TranscriptBinding],
+        stage: TranscriptStage,
+    ) -> SampledChallenge {
+        let mut bytes = self
+            .hash_identifier
+            .to_transcript_binding()
+            .canonical_bytes()
+            .to_vec();
+        bytes.push(transcript_stage_discriminant(stage));
+        bytes.extend_from_slice(&(absorbed_prefix.len() as u32).to_le_bytes());
+        for binding in absorbed_prefix {
+            bytes.extend_from_slice(&(binding.domain_label().len() as u32).to_le_bytes());
+            bytes.extend_from_slice(binding.domain_label().as_bytes());
+            bytes.extend_from_slice(&(binding.canonical_bytes().len() as u32).to_le_bytes());
+            bytes.extend_from_slice(binding.canonical_bytes());
+        }
+        SampledChallenge::new(stage, bytes)
     }
 }
 
@@ -131,6 +249,23 @@ pub enum ReferenceTranscriptError {
         /// The domain label that was absent.
         domain_label: String,
     },
+    /// The transcript was finished before every planned stage was consumed.
+    IncompleteTranscript {
+        /// Next stage expected by the transcript.
+        next_stage: Option<TranscriptStage>,
+    },
+    /// End-of-transcript binding validation failed.
+    BindingFinalization(TranscriptBindingError),
+    /// A sampled challenge did not replay to the same bytes.
+    ChallengeReplayMismatch {
+        /// Stage whose challenge failed replay.
+        stage: TranscriptStage,
+    },
+    /// A sampling stage was advanced without recording the sampled challenge.
+    MissingSampledChallenge {
+        /// Sampling stage with no recorded challenge.
+        stage: TranscriptStage,
+    },
 }
 
 impl fmt::Display for ReferenceTranscriptError {
@@ -151,6 +286,23 @@ impl fmt::Display for ReferenceTranscriptError {
                 "binding {domain_label:?} was not absorbed before reaching stage {stage}; \
                  absorb it during the preceding observe stage to satisfy the Fiat-Shamir requirement"
             ),
+            Self::IncompleteTranscript { next_stage } => write!(
+                f,
+                "cannot finish transcript before all stages are consumed; next stage is {next_stage:?}"
+            ),
+            Self::BindingFinalization(err) => err.fmt(f),
+            Self::ChallengeReplayMismatch { stage } => {
+                write!(
+                    f,
+                    "sampled challenge at stage {stage} failed verifier replay"
+                )
+            }
+            Self::MissingSampledChallenge { stage } => {
+                write!(
+                    f,
+                    "sampling stage {stage} advanced without recording a challenge"
+                )
+            }
         }
     }
 }
@@ -2294,7 +2446,7 @@ impl CodewordEmbeddingAdapter for ReferencePlonky3Adapter {
 mod tests {
     use super::{
         REFERENCE_LOG_BLOWUP, REFERENCE_NUM_RANDOM_CODEWORDS, ReferenceAdapterError,
-        ReferenceBindingRecord, ReferenceCodewordEmbeddingAdapterError,
+        ReferenceBindingRecord, ReferenceChallengeDeriver, ReferenceCodewordEmbeddingAdapterError,
         ReferenceHidingFriPcsProfile, ReferenceLayeredAdapter, ReferenceLayeredAdapterError,
         ReferenceLayeredCommitmentCarrier, ReferenceLayeredHiddenAuxiliaryCarrier,
         ReferenceLayeredOracleCommitmentAdapterError, ReferenceLayeredOracleCommitmentCarrier,
@@ -2303,15 +2455,15 @@ mod tests {
         ReferenceLayeredQuotientCommitmentCarrier, ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
         ReferenceLayeredQuotientHiderAdapterError, ReferenceLayeredQuotientOpeningCarrier,
         ReferenceOracleCommitmentAdapterError, ReferencePerfectRandomizerBackend,
-        ReferencePerfectRandomizerError, ReferencePlonky3Adapter,
-        ReferencePlonky3CodewordCommitmentSlot, ReferencePlonky3CodewordHiddenAuxiliarySlot,
-        ReferencePlonky3CodewordPublicOpeningSlot, ReferencePlonky3CommitmentSlot,
-        ReferencePlonky3HiddenAuxiliarySlot, ReferencePlonky3OracleCommitmentSlot,
-        ReferencePlonky3OracleHiddenAuxiliarySlot, ReferencePlonky3OracleOpeningSlot,
-        ReferencePlonky3PublicOpeningSlot, ReferencePlonky3QuotientCommitmentSlot,
-        ReferencePlonky3QuotientHiddenAuxiliarySlot, ReferencePlonky3QuotientOpeningSlot,
-        ReferenceProjectionAdapterError, ReferenceQuotientHiderAdapterError, ReferenceTranscript,
-        ReferenceTranscriptError,
+        ReferencePerfectRandomizerCommitment, ReferencePerfectRandomizerError,
+        ReferencePlonky3Adapter, ReferencePlonky3CodewordCommitmentSlot,
+        ReferencePlonky3CodewordHiddenAuxiliarySlot, ReferencePlonky3CodewordPublicOpeningSlot,
+        ReferencePlonky3CommitmentSlot, ReferencePlonky3HiddenAuxiliarySlot,
+        ReferencePlonky3OracleCommitmentSlot, ReferencePlonky3OracleHiddenAuxiliarySlot,
+        ReferencePlonky3OracleOpeningSlot, ReferencePlonky3PublicOpeningSlot,
+        ReferencePlonky3QuotientCommitmentSlot, ReferencePlonky3QuotientHiddenAuxiliarySlot,
+        ReferencePlonky3QuotientOpeningSlot, ReferenceProjectionAdapterError,
+        ReferenceQuotientHiderAdapterError, ReferenceTranscript, ReferenceTranscriptError,
     };
     use shroud_adapter::{
         BatchOpeningAdapter, BatchOpeningAdapterPlan, CodewordEmbeddingAdapter,
@@ -2328,8 +2480,9 @@ mod tests {
     use shroud_core::{
         AuxiliaryTransport, BasisDescriptor, DOMAIN_BASIS, DOMAIN_DEGREE_CONTRACT,
         DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS,
-        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, SecurityLevel, TranscriptBindable,
-        TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest, TranscriptStage,
+        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, HashIdentifier, PublicOpeningBinding,
+        SecurityLevel, StandardBatchOpeningBindings, TranscriptBindable, TranscriptBinding,
+        TranscriptBindingError, TranscriptBindingManifest, TranscriptStage,
     };
     use shroud_opening_projection::{
         AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
@@ -2354,7 +2507,7 @@ mod tests {
                 .expect("stage should be accepted");
         }
 
-        assert!(transcript.is_complete());
+        assert_eq!(transcript.expected_stage(), None);
     }
 
     #[test]
@@ -3549,42 +3702,148 @@ mod tests {
 
     // ── Transcript binding tests ─────────────────────────────────────────────────
 
-    fn build_complete_finalize_state() -> (TranscriptBindingManifest, ReferenceBindingRecord) {
-        use shroud_quotient_hider::QuotientDegreeContract;
+    struct StandardManifestFixture {
+        batch_spec: ShroudBatchOpeningSpec,
+        codeword_spec: ShroudCodewordEmbeddingSpec,
+        oracle_spec: ShroudOracleCommitmentSpec,
+        projection_spec: ShroudOpeningProjectionSpec,
+        quotient_spec: ShroudQuotientHiderSpec,
+        degree_contract: QuotientDegreeContract,
+        randomizer_commitment: ReferencePerfectRandomizerCommitment,
+        public_openings: PublicOpeningBinding,
+        profile: ReferenceHidingFriPcsProfile,
+        basis: BasisDescriptor,
+        hash_identifier: HashIdentifier,
+        deriver: ReferenceChallengeDeriver,
+    }
 
-        let profile = ReferenceHidingFriPcsProfile::standard();
+    fn standard_manifest_fixture() -> StandardManifestFixture {
         let basis = BasisDescriptor::plonky3_binomial(4);
-        let oracle = ShroudOracleCommitmentSpec::statistical(
-            OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape"),
+        let batch_shape = BatchOpeningShape::new(4, 2, 4).expect("valid batch shape");
+        let batch_spec = ShroudBatchOpeningSpec::perfect(
+            batch_shape,
+            15,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(basis),
+        )
+        .expect("valid batch spec");
+        let codeword_shape =
+            CodewordEmbeddingShape::new(8, 4, 16, 4).expect("valid codeword shape");
+        let codeword_spec =
+            ShroudCodewordEmbeddingSpec::statistical(codeword_shape).expect("valid codeword spec");
+        let oracle_spec = ShroudOracleCommitmentSpec::statistical(
+            OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid oracle shape"),
             OracleAuxiliaryTransport::InBandWithOpeningProof,
         )
         .expect("valid oracle spec");
-        let security = SecurityLevel::Statistical;
-        let contract =
+        let projection_spec = ShroudOpeningProjectionSpec::statistical(
+            OpeningProjectionShape::new(4, 8, 3).expect("valid projection shape"),
+            AuxiliaryOpeningTransport::InBandWithMainProof,
+        )
+        .expect("valid projection spec");
+        let degree_contract =
             QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid contract");
-        let randomizer_binding =
-            TranscriptBinding::new(DOMAIN_RANDOMIZER_COMMITMENT, vec![0xAB; 16]);
-        let public_openings_binding = TranscriptBinding::new(DOMAIN_PUBLIC_OPENINGS, vec![0xCD; 8]);
+        let quotient_spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            2,
+            QuotientHiderShape::new(2, 2, 1, 1, 1).expect("valid quotient shape"),
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(degree_contract),
+        )
+        .expect("valid quotient spec");
+        let randomizer_commitment = ReferencePerfectRandomizerCommitment {
+            model: PerfectRandomizerCommitment::encoded_oracle_bundle(basis),
+            shape: batch_shape,
+        };
+        let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]);
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let hash_identifier = HashIdentifier::new("shroud-reference-transcript-v1");
+        let deriver = ReferenceChallengeDeriver::new(hash_identifier.clone());
 
-        let manifest = TranscriptBindingManifest::new()
-            .with_before_batching_challenge(profile.to_transcript_binding())
-            .with_before_batching_challenge(basis.to_transcript_binding())
-            .with_before_batching_challenge(oracle.to_transcript_binding())
-            .with_before_batching_challenge(security.to_transcript_binding())
-            .with_before_ood_point(contract.to_transcript_binding())
-            .with_before_ood_point(randomizer_binding.clone())
-            .with_before_prove_masked(public_openings_binding.clone());
+        StandardManifestFixture {
+            batch_spec,
+            codeword_spec,
+            oracle_spec,
+            projection_spec,
+            quotient_spec,
+            degree_contract,
+            randomizer_commitment,
+            public_openings,
+            profile,
+            basis,
+            hash_identifier,
+            deriver,
+        }
+    }
+
+    fn standard_manifest_from_fixture(
+        fixture: &StandardManifestFixture,
+    ) -> TranscriptBindingManifest {
+        TranscriptBindingManifest::standard_for_batch_opening(
+            StandardBatchOpeningBindings::from_bindables(
+                &fixture.hash_identifier,
+                &fixture.profile,
+                &fixture.basis,
+                &fixture.batch_spec,
+                &fixture.codeword_spec,
+                &fixture.oracle_spec,
+                &fixture.projection_spec,
+                &fixture.quotient_spec,
+                &fixture.batch_spec.security_level(),
+                &fixture.degree_contract,
+                &fixture.randomizer_commitment,
+                &fixture.public_openings,
+            ),
+        )
+    }
+
+    fn build_complete_finalize_state() -> (TranscriptBindingManifest, ReferenceBindingRecord) {
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
 
         let mut record = ReferenceBindingRecord::new();
-        record.absorb_bindable(&profile);
-        record.absorb_bindable(&basis);
-        record.absorb_bindable(&oracle);
-        record.absorb_bindable(&security);
-        record.absorb_bindable(&contract);
-        record.absorb(randomizer_binding);
-        record.absorb(public_openings_binding);
+        record.absorb_bindable(&fixture.hash_identifier);
+        record.absorb_bindable(&fixture.profile);
+        record.absorb_bindable(&fixture.basis);
+        record.absorb_bindable(&fixture.batch_spec);
+        record.absorb_bindable(&fixture.codeword_spec);
+        record.absorb_bindable(&fixture.oracle_spec);
+        record.absorb_bindable(&fixture.projection_spec);
+        record.absorb_bindable(&fixture.quotient_spec);
+        record.absorb_bindable(&fixture.batch_spec.security_level());
+        record.absorb_bindable(&fixture.degree_contract);
+        record.absorb_bindable(&fixture.randomizer_commitment);
+        record.absorb_bindable(&fixture.public_openings);
 
         (manifest, record)
+    }
+
+    #[test]
+    fn standard_manifest_routes_all_canonical_batch_opening_bindings() {
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+        let batching_domains: Vec<_> = manifest
+            .required_before(TranscriptStage::SampleBatchingChallenge)
+            .iter()
+            .map(TranscriptBinding::domain_label)
+            .collect();
+        assert!(batching_domains.contains(&shroud_core::DOMAIN_HASH_ID));
+        assert!(batching_domains.contains(&shroud_core::DOMAIN_BATCH_OPENING));
+        assert!(batching_domains.contains(&shroud_core::DOMAIN_CODEWORD_EMBEDDING));
+        assert!(batching_domains.contains(&shroud_core::DOMAIN_OPENING_PROJECTION));
+        assert!(batching_domains.contains(&shroud_core::DOMAIN_QUOTIENT_HIDER));
+        assert_eq!(
+            manifest
+                .required_before(TranscriptStage::SampleOodPoint)
+                .len(),
+            2
+        );
+        assert_eq!(
+            manifest
+                .required_before(TranscriptStage::ProveMaskedRelation)
+                .first()
+                .map(TranscriptBinding::domain_label),
+            Some(DOMAIN_PUBLIC_OPENINGS)
+        );
     }
 
     #[test]
@@ -3869,6 +4128,158 @@ mod tests {
         transcript
             .advance(TranscriptStage::SampleBatchingChallenge)
             .expect("exact binding should satisfy the gate");
+    }
+
+    #[test]
+    fn finish_requires_recorded_sampling_challenges() {
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.hash_identifier);
+        transcript.record_mut().absorb_bindable(&fixture.profile);
+        transcript.record_mut().absorb_bindable(&fixture.basis);
+        transcript.record_mut().absorb_bindable(&fixture.batch_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.codeword_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.oracle_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.projection_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.quotient_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.batch_spec.security_level());
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.degree_contract);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.randomizer_commitment);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.public_openings);
+
+        for stage in fixture.batch_spec.transcript_plan().stages() {
+            transcript.advance(*stage).expect("stage should advance");
+        }
+
+        assert!(matches!(
+            transcript.finish(&fixture.deriver),
+            Err(ReferenceTranscriptError::MissingSampledChallenge {
+                stage: TranscriptStage::SampleBatchingChallenge
+            })
+        ));
+    }
+
+    #[test]
+    fn finish_replays_recorded_challenges() {
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.hash_identifier);
+        transcript.record_mut().absorb_bindable(&fixture.profile);
+        transcript.record_mut().absorb_bindable(&fixture.basis);
+        transcript.record_mut().absorb_bindable(&fixture.batch_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.codeword_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.oracle_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.projection_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.quotient_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.batch_spec.security_level());
+
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("observe main");
+        transcript
+            .sample_challenge(TranscriptStage::SampleBatchingChallenge, &fixture.deriver)
+            .expect("batching challenge");
+        transcript
+            .advance(TranscriptStage::ObserveQuotientCommitments)
+            .expect("observe quotient");
+        transcript
+            .advance(TranscriptStage::ObserveRandomizerCommitment)
+            .expect("observe randomizer");
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.degree_contract);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.randomizer_commitment);
+        transcript
+            .sample_challenge(TranscriptStage::SampleOodPoint, &fixture.deriver)
+            .expect("ood challenge");
+        transcript
+            .advance(TranscriptStage::ObservePublicOpenings)
+            .expect("observe openings");
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.public_openings);
+        transcript
+            .advance(TranscriptStage::ProveMaskedRelation)
+            .expect("prove masked");
+
+        assert!(transcript.finish(&fixture.deriver).is_ok());
+    }
+
+    #[test]
+    fn replay_rejects_wrong_hash_identifier() {
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.hash_identifier);
+        transcript.record_mut().absorb_bindable(&fixture.profile);
+        transcript.record_mut().absorb_bindable(&fixture.basis);
+        transcript.record_mut().absorb_bindable(&fixture.batch_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.codeword_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.oracle_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.projection_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.quotient_spec);
+        transcript
+            .record_mut()
+            .absorb_bindable(&fixture.batch_spec.security_level());
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("observe main");
+        transcript
+            .sample_challenge(TranscriptStage::SampleBatchingChallenge, &fixture.deriver)
+            .expect("batching challenge");
+
+        let wrong_deriver =
+            ReferenceChallengeDeriver::new(HashIdentifier::new("wrong-transcript-suite"));
+        assert_eq!(
+            transcript.replay_challenges(&wrong_deriver),
+            Err(ReferenceTranscriptError::ChallengeReplayMismatch {
+                stage: TranscriptStage::SampleBatchingChallenge,
+            })
+        );
     }
 
     // ── Exact-bytes validation tests ─────────────────────────────────────────────

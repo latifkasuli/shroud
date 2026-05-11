@@ -1,6 +1,6 @@
 # SHROUD
 
-Structured Hiding for Reed-Solomon Oracles Under FRI.
+Structured Hiding for Reed-Solomon Oracles Under Decomposition.
 
 This workspace is a small reference/spec implementation for the SHROUD protocol notes. It is not a proving system. The goal is to make the protocol objects concrete before adapting them into systems like Plonky3.
 
@@ -50,10 +50,17 @@ cargo test --workspace
 
 ## Roadmap
 
-Near-term work:
+Completed foundations:
 
-1. Add a `BasisDescriptor` to the perfect encoded-oracle bundle path so extension-degree, coordinate order, and reconstruction rules are self-describing.
-2. Add property tests for transcript stage permutations, degree-budget violations, payload accounting, and malformed plans.
-3. Build a thin Plonky3 prototype in `shroud-reference` around `HidingFriPcs`.
+1. `BasisDescriptor` makes encoded-oracle bundle field reconstruction self-describing.
+2. Transcript order, degree-budget, payload-accounting, and malformed-plan cases have focused tests across the workspace.
+3. Fiat-Shamir binding now has a backend-neutral manifest layer, canonical `TranscriptBindable` surfaces, hash-suite binding, public-opening bindings, and reference challenge replay.
+4. `shroud-reference` contains the thin Plonky3-facing profile/prototype surface for `HidingFriPcs` alignment checks.
 
-The codeword embedding's hidden row expansion should be captured as a design note when the Plonky3 reference adapter lands, because that detail is observable at the backend commitment layer rather than through the verifier-facing payload alone.
+Next bridge work:
+
+1. Wire the canonical batch-opening manifest into the concrete Plonky3 transcript.
+2. Replace reference challenge derivation with the production Plonky3 Fiat-Shamir sponge.
+3. Add bridge-level tests that compare prover absorption, verifier replay, and sampled challenges byte-for-byte.
+
+The codeword embedding's hidden row expansion should be captured as a design note when the Plonky3 bridge lands, because that detail is observable at the backend commitment layer rather than through the verifier-facing payload alone.

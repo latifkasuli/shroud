@@ -13,7 +13,10 @@
 
 use core::fmt;
 
-use shroud_core::{DOMAIN_DEGREE_CONTRACT, SecurityLevel, TranscriptBindable, TranscriptBinding};
+use shroud_core::{
+    DOMAIN_DEGREE_CONTRACT, DOMAIN_QUOTIENT_HIDER, SecurityLevel, TranscriptBindable,
+    TranscriptBinding,
+};
 
 /// Quotient decomposition family supported by the hiding transform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -509,6 +512,62 @@ impl ShroudQuotientHiderSpec {
         }
 
         Ok(())
+    }
+}
+
+impl TranscriptBindable for ShroudQuotientHiderSpec {
+    /// Encodes the complete quotient-hider spec: security level, decomposition
+    /// family, query budget, shape, derived payload, auxiliary transport, and
+    /// optional degree contract.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::new();
+        bytes.push(security_level_discriminant(self.security_level()));
+        bytes.push(decomposition_family_discriminant(
+            self.decomposition_family(),
+        ));
+        bytes.extend_from_slice(&(self.query_budget() as u64).to_le_bytes());
+        let shape = self.shape();
+        bytes.extend_from_slice(&(shape.decomposition_components() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.opening_points() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.openings_per_point() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.hidden_mask_values_per_point() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.hidden_normalization_items() as u64).to_le_bytes());
+        let payload = self.payload();
+        bytes.extend_from_slice(&(payload.public_commitments() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.public_opening_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.hidden_mask_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.hidden_normalization_items() as u64).to_le_bytes());
+        bytes.push(auxiliary_transport_discriminant(self.auxiliary_transport()));
+        match self.degree_contract() {
+            Some(contract) => {
+                bytes.push(1);
+                bytes.extend_from_slice(contract.to_transcript_binding().canonical_bytes());
+            }
+            None => bytes.push(0),
+        }
+        TranscriptBinding::new(DOMAIN_QUOTIENT_HIDER, bytes)
+    }
+}
+
+const fn security_level_discriminant(security_level: SecurityLevel) -> u8 {
+    match security_level {
+        SecurityLevel::Statistical => 0,
+        SecurityLevel::Perfect => 1,
+    }
+}
+
+const fn decomposition_family_discriminant(family: QuotientDecompositionFamily) -> u8 {
+    match family {
+        QuotientDecompositionFamily::Monolithic => 0,
+        QuotientDecompositionFamily::DegreeChunked => 1,
+        QuotientDecompositionFamily::Segmented => 2,
+    }
+}
+
+const fn auxiliary_transport_discriminant(transport: QuotientAuxiliaryTransport) -> u8 {
+    match transport {
+        QuotientAuxiliaryTransport::InBandWithOpeningProof => 0,
+        QuotientAuxiliaryTransport::SeparateAuxiliaryProof => 1,
     }
 }
 

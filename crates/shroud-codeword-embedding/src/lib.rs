@@ -24,7 +24,10 @@
 
 use core::fmt;
 
-use shroud_core::{AuxiliaryTransport, SecurityLevel};
+use shroud_core::{
+    AuxiliaryTransport, DOMAIN_CODEWORD_EMBEDDING, SecurityLevel, TranscriptBindable,
+    TranscriptBinding,
+};
 
 /// Shape of the codeword embedding: trace, randomizer, domain, and field parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,6 +287,44 @@ impl ShroudCodewordEmbeddingSpec {
         }
 
         Ok(())
+    }
+}
+
+impl TranscriptBindable for ShroudCodewordEmbeddingSpec {
+    /// Encodes the complete codeword-embedding spec: security level, shape,
+    /// derived payload, required blowup, and auxiliary transport.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::with_capacity(73);
+        bytes.push(security_level_discriminant(self.security_level()));
+        let shape = self.shape();
+        bytes.extend_from_slice(&(shape.trace_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.randomizer_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.committed_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.domain_log_size() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.extension_degree() as u64).to_le_bytes());
+        let payload = self.payload();
+        bytes.extend_from_slice(&(payload.committed_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.public_trace_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.hidden_randomizer_columns() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.required_log_blowup() as u64).to_le_bytes());
+        bytes.push(auxiliary_transport_discriminant(
+            payload.auxiliary_transport(),
+        ));
+        TranscriptBinding::new(DOMAIN_CODEWORD_EMBEDDING, bytes)
+    }
+}
+
+const fn security_level_discriminant(security_level: SecurityLevel) -> u8 {
+    match security_level {
+        SecurityLevel::Statistical => 0,
+        SecurityLevel::Perfect => 1,
+    }
+}
+
+const fn auxiliary_transport_discriminant(transport: AuxiliaryTransport) -> u8 {
+    match transport {
+        AuxiliaryTransport::InBand => 0,
+        AuxiliaryTransport::SeparateEnvelope => 1,
     }
 }
 

@@ -14,8 +14,8 @@
 
 use core::fmt;
 
-use crate::SecurityLevel;
 use crate::claim::{BasisDescriptor, CoordinateOrder, ReconstructionRule};
+use crate::{DegreeBudget, HidingTechniqueClaim, SecurityLevel, TranscriptStage};
 
 /// Domain label for the SHROUD hiding profile (log-blowup, randomizer count, basis).
 pub const DOMAIN_PROFILE: &str = "SHROUD_V1_PROFILE";
@@ -37,6 +37,30 @@ pub const DOMAIN_SECURITY_LEVEL: &str = "SHROUD_V1_SECURITY_LEVEL";
 
 /// Domain label for public opening values observed before final verification.
 pub const DOMAIN_PUBLIC_OPENINGS: &str = "SHROUD_V1_PUBLIC_OPENINGS";
+
+/// Domain label for the complete batch-opening SHROUD spec.
+pub const DOMAIN_BATCH_OPENING: &str = "SHROUD_V1_BATCH_OPENING";
+
+/// Domain label for the complete codeword-embedding SHROUD spec.
+pub const DOMAIN_CODEWORD_EMBEDDING: &str = "SHROUD_V1_CODEWORD_EMBEDDING";
+
+/// Domain label for the complete opening-projection SHROUD spec.
+pub const DOMAIN_OPENING_PROJECTION: &str = "SHROUD_V1_OPENING_PROJECTION";
+
+/// Domain label for the complete quotient-hider SHROUD spec.
+pub const DOMAIN_QUOTIENT_HIDER: &str = "SHROUD_V1_QUOTIENT_HIDER";
+
+/// Domain label for a batch-opening degree budget.
+pub const DOMAIN_DEGREE_BUDGET: &str = "SHROUD_V1_DEGREE_BUDGET";
+
+/// Domain label for a declared hiding-technique claim.
+pub const DOMAIN_HIDING_TECHNIQUE: &str = "SHROUD_V1_HIDING_TECHNIQUE";
+
+/// Domain label for the Fiat-Shamir hash or transcript suite identifier.
+pub const DOMAIN_HASH_ID: &str = "SHROUD_V1_HASH_ID";
+
+/// Domain label for sampled Fiat-Shamir challenges recorded by a verifier.
+pub const DOMAIN_SAMPLED_CHALLENGE: &str = "SHROUD_V1_SAMPLED_CHALLENGE";
 
 /// A single transcript absorption event: a domain-separated label and its canonical bytes.
 ///
@@ -84,6 +108,119 @@ impl TranscriptBinding {
 pub trait TranscriptBindable {
     /// Returns a canonical transcript binding for this object.
     fn to_transcript_binding(&self) -> TranscriptBinding;
+}
+
+/// Identifier for the Fiat-Shamir hash, sponge, or transcript suite.
+///
+/// This is deliberately protocol-facing. Two backends with identical absorbed
+/// SHROUD objects but different challenge derivation suites must not share the
+/// same transcript.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashIdentifier {
+    suite: String,
+}
+
+impl HashIdentifier {
+    /// Creates a hash-suite identifier from a stable ASCII/UTF-8 name.
+    #[must_use]
+    pub fn new(suite: impl Into<String>) -> Self {
+        Self {
+            suite: suite.into(),
+        }
+    }
+
+    /// Returns the declared hash-suite name.
+    #[must_use]
+    pub fn suite(&self) -> &str {
+        &self.suite
+    }
+}
+
+impl TranscriptBindable for HashIdentifier {
+    /// Encodes the hash-suite name as `u32_le(len) || suite_bytes`.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        TranscriptBinding::new(DOMAIN_HASH_ID, length_prefixed_bytes(self.suite.as_bytes()))
+    }
+}
+
+/// Canonical verifier-visible public opening bytes supplied by a backend.
+///
+/// SHROUD is field- and backend-neutral, so it cannot serialize concrete field
+/// elements by itself. A backend bridge must provide the exact bytes that both
+/// prover and verifier absorb for the public openings it exposes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicOpeningBinding {
+    canonical_bytes: Vec<u8>,
+}
+
+impl PublicOpeningBinding {
+    /// Creates a public-opening binding from backend-canonical bytes.
+    #[must_use]
+    pub fn new(canonical_bytes: Vec<u8>) -> Self {
+        Self { canonical_bytes }
+    }
+
+    /// Returns the backend-canonical public-opening bytes.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+impl TranscriptBindable for PublicOpeningBinding {
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        TranscriptBinding::new(DOMAIN_PUBLIC_OPENINGS, self.canonical_bytes.clone())
+    }
+}
+
+/// A sampled Fiat-Shamir challenge recorded for verifier replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampledChallenge {
+    stage: TranscriptStage,
+    bytes: Vec<u8>,
+}
+
+impl SampledChallenge {
+    /// Creates a sampled challenge for a transcript stage.
+    #[must_use]
+    pub fn new(stage: TranscriptStage, bytes: Vec<u8>) -> Self {
+        Self { stage, bytes }
+    }
+
+    /// Stage at which this challenge was sampled.
+    #[must_use]
+    pub const fn stage(&self) -> TranscriptStage {
+        self.stage
+    }
+
+    /// Challenge bytes produced by the transcript suite.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl TranscriptBindable for SampledChallenge {
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::with_capacity(1 + 4 + self.bytes.len());
+        bytes.push(transcript_stage_discriminant(self.stage));
+        bytes.extend_from_slice(&(self.bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&self.bytes);
+        TranscriptBinding::new(DOMAIN_SAMPLED_CHALLENGE, bytes)
+    }
+}
+
+/// Deterministic Fiat-Shamir challenge derivation used by verifier replay.
+pub trait TranscriptChallengeDeriver {
+    /// Hash-suite identifier that must also be bound into the manifest.
+    fn hash_identifier(&self) -> HashIdentifier;
+
+    /// Re-derives the challenge for `stage` from the absorbed binding prefix.
+    fn derive_challenge(
+        &self,
+        absorbed_prefix: &[TranscriptBinding],
+        stage: TranscriptStage,
+    ) -> SampledChallenge;
 }
 
 /// Error raised when a required transcript binding is absent from the record.
@@ -159,6 +296,91 @@ impl TranscriptBindable for BasisDescriptor {
     }
 }
 
+impl TranscriptBindable for DegreeBudget {
+    /// Encodes relation degree, randomizer degree, and masked relation degree as u64 LE.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(&(self.relation_degree() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.randomizer_degree() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.masked_relation_degree_bound() as u64).to_le_bytes());
+        TranscriptBinding::new(DOMAIN_DEGREE_BUDGET, bytes)
+    }
+}
+
+impl TranscriptBindable for HidingTechniqueClaim {
+    /// Encodes the hiding-technique claim tree with its own transcript domain.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        TranscriptBinding::new(DOMAIN_HIDING_TECHNIQUE, self.to_canonical_bytes())
+    }
+}
+
+/// Complete canonical binding set for a SHROUD batch-opening transcript.
+///
+/// Construct this with [`Self::from_bindables`] rather than hand-writing a
+/// manifest. That keeps bridge code on the reviewed path and makes omissions
+/// visible at compile time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardBatchOpeningBindings {
+    hash_identifier: TranscriptBinding,
+    profile: TranscriptBinding,
+    basis: TranscriptBinding,
+    batch_opening: TranscriptBinding,
+    codeword_embedding: TranscriptBinding,
+    oracle_commitment: TranscriptBinding,
+    opening_projection: TranscriptBinding,
+    quotient_hider: TranscriptBinding,
+    security_level: TranscriptBinding,
+    degree_contract: TranscriptBinding,
+    randomizer_commitment: TranscriptBinding,
+    public_openings: TranscriptBinding,
+}
+
+impl StandardBatchOpeningBindings {
+    /// Builds the canonical binding set from concrete protocol objects.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_bindables<
+        Profile: TranscriptBindable,
+        Basis: TranscriptBindable,
+        BatchOpening: TranscriptBindable,
+        CodewordEmbedding: TranscriptBindable,
+        OracleCommitment: TranscriptBindable,
+        OpeningProjection: TranscriptBindable,
+        QuotientHider: TranscriptBindable,
+        DegreeContract: TranscriptBindable,
+        RandomizerCommitment: TranscriptBindable,
+        PublicOpenings: TranscriptBindable,
+    >(
+        hash_identifier: &HashIdentifier,
+        profile: &Profile,
+        basis: &Basis,
+        batch_opening: &BatchOpening,
+        codeword_embedding: &CodewordEmbedding,
+        oracle_commitment: &OracleCommitment,
+        opening_projection: &OpeningProjection,
+        quotient_hider: &QuotientHider,
+        security_level: &SecurityLevel,
+        degree_contract: &DegreeContract,
+        randomizer_commitment: &RandomizerCommitment,
+        public_openings: &PublicOpenings,
+    ) -> Self {
+        Self {
+            hash_identifier: hash_identifier.to_transcript_binding(),
+            profile: profile.to_transcript_binding(),
+            basis: basis.to_transcript_binding(),
+            batch_opening: batch_opening.to_transcript_binding(),
+            codeword_embedding: codeword_embedding.to_transcript_binding(),
+            oracle_commitment: oracle_commitment.to_transcript_binding(),
+            opening_projection: opening_projection.to_transcript_binding(),
+            quotient_hider: quotient_hider.to_transcript_binding(),
+            security_level: security_level.to_transcript_binding(),
+            degree_contract: degree_contract.to_transcript_binding(),
+            randomizer_commitment: randomizer_commitment.to_transcript_binding(),
+            public_openings: public_openings.to_transcript_binding(),
+        }
+    }
+}
+
 /// A per-sampling-stage manifest of expected transcript bindings.
 ///
 /// Associates each sampling stage with the exact [`TranscriptBinding`] values
@@ -185,6 +407,27 @@ impl TranscriptBindingManifest {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds the canonical SHROUD v1 batch-opening manifest.
+    ///
+    /// Prefer this constructor for backend bridges. The empty [`Self::new`]
+    /// constructor is intended for narrow schedule tests or custom experiments.
+    #[must_use]
+    pub fn standard_for_batch_opening(bindings: StandardBatchOpeningBindings) -> Self {
+        Self::new()
+            .with_before_batching_challenge(bindings.hash_identifier)
+            .with_before_batching_challenge(bindings.profile)
+            .with_before_batching_challenge(bindings.basis)
+            .with_before_batching_challenge(bindings.batch_opening)
+            .with_before_batching_challenge(bindings.codeword_embedding)
+            .with_before_batching_challenge(bindings.oracle_commitment)
+            .with_before_batching_challenge(bindings.opening_projection)
+            .with_before_batching_challenge(bindings.quotient_hider)
+            .with_before_batching_challenge(bindings.security_level)
+            .with_before_ood_point(bindings.degree_contract)
+            .with_before_ood_point(bindings.randomizer_commitment)
+            .with_before_prove_masked(bindings.public_openings)
     }
 
     /// Adds an expected binding that must be present before `SampleBatchingChallenge`.
@@ -220,6 +463,27 @@ impl TranscriptBindingManifest {
             _ => &[],
         }
     }
+}
+
+/// Returns the stable one-byte discriminant for a transcript stage.
+#[must_use]
+pub const fn transcript_stage_discriminant(stage: TranscriptStage) -> u8 {
+    match stage {
+        TranscriptStage::ObserveMainCommitments => 0,
+        TranscriptStage::SampleBatchingChallenge => 1,
+        TranscriptStage::ObserveQuotientCommitments => 2,
+        TranscriptStage::ObserveRandomizerCommitment => 3,
+        TranscriptStage::SampleOodPoint => 4,
+        TranscriptStage::ObservePublicOpenings => 5,
+        TranscriptStage::ProveMaskedRelation => 6,
+    }
+}
+
+fn length_prefixed_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
 }
 
 #[cfg(test)]
@@ -277,6 +541,14 @@ mod tests {
             DOMAIN_DEGREE_CONTRACT,
             DOMAIN_SECURITY_LEVEL,
             DOMAIN_PUBLIC_OPENINGS,
+            DOMAIN_BATCH_OPENING,
+            DOMAIN_CODEWORD_EMBEDDING,
+            DOMAIN_OPENING_PROJECTION,
+            DOMAIN_QUOTIENT_HIDER,
+            DOMAIN_DEGREE_BUDGET,
+            DOMAIN_HIDING_TECHNIQUE,
+            DOMAIN_HASH_ID,
+            DOMAIN_SAMPLED_CHALLENGE,
         ];
         for i in 0..labels.len() {
             for j in (i + 1)..labels.len() {
@@ -336,5 +608,30 @@ mod tests {
                 .required_before(TranscriptStage::SampleOodPoint)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hash_identifier_binds_transcript_suite_name() {
+        let binding = HashIdentifier::new("poseidon2-babybear-v1").to_transcript_binding();
+        assert_eq!(binding.domain_label(), DOMAIN_HASH_ID);
+        assert!(
+            binding
+                .canonical_bytes()
+                .ends_with(b"poseidon2-babybear-v1")
+        );
+    }
+
+    #[test]
+    fn public_opening_binding_uses_public_openings_domain() {
+        let binding = PublicOpeningBinding::new(vec![1, 2, 3]).to_transcript_binding();
+        assert_eq!(binding.domain_label(), DOMAIN_PUBLIC_OPENINGS);
+        assert_eq!(binding.canonical_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn hiding_technique_claim_has_its_own_binding_domain() {
+        let binding = HidingTechniqueClaim::RandomCodewordInterleaving.to_transcript_binding();
+        assert_eq!(binding.domain_label(), DOMAIN_HIDING_TECHNIQUE);
+        assert_eq!(binding.canonical_bytes(), &[0]);
     }
 }

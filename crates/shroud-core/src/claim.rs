@@ -1,6 +1,11 @@
 use core::fmt;
 
 /// The source of randomness used by a hiding commitment.
+///
+/// This declares an audit obligation; SHROUD cannot detect nonce/randomness
+/// reuse inside a backend prover. Concrete bridges must enforce freshness when
+/// sampling the random codewords, mask polynomials, row padding, and any other
+/// hiding material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RandomnessModel {
     /// Fresh uniform randomness is sampled per proof from OS entropy.

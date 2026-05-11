@@ -13,8 +13,9 @@
 use core::fmt;
 
 use shroud_core::{
-    BasisDescriptor, DegreeBudget, DegreeBudgetError, SecurityLevel, TranscriptPlan,
-    TranscriptPlanError,
+    BasisDescriptor, DOMAIN_BATCH_OPENING, DegreeBudget, DegreeBudgetError, SecurityLevel,
+    TranscriptBindable, TranscriptBinding, TranscriptPlan, TranscriptPlanError,
+    transcript_stage_discriminant,
 };
 
 /// Statement shape for a reduced batch-opening relation.
@@ -737,6 +738,61 @@ impl ShroudBatchOpeningSpec {
         }
 
         Ok(())
+    }
+}
+
+impl TranscriptBindable for ShroudBatchOpeningSpec {
+    /// Encodes the full batch-opening spec: security level, shape, degree budget,
+    /// transcript schedule, commitment boundary, and randomizer realization.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::new();
+        bytes.push(security_level_discriminant(self.security_level()));
+        let shape = self.shape();
+        bytes.extend_from_slice(&(shape.committed_polynomials() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.opening_points() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.extension_degree() as u64).to_le_bytes());
+        let degree_budget = self.degree_budget();
+        bytes.extend_from_slice(&(degree_budget.relation_degree() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(degree_budget.randomizer_degree() as u64).to_le_bytes());
+        bytes.extend_from_slice(
+            &(degree_budget.masked_relation_degree_bound() as u64).to_le_bytes(),
+        );
+        bytes.extend_from_slice(&(self.transcript_plan().stages().len() as u32).to_le_bytes());
+        for stage in self.transcript_plan().stages() {
+            bytes.push(transcript_stage_discriminant(*stage));
+        }
+        bytes.push(commitment_boundary_discriminant(self.commitment_boundary()));
+        match self.randomizer() {
+            RandomizerSpec::Statistical(model) => {
+                bytes.push(0);
+                bytes.extend_from_slice(&(model.coordinate_polynomials() as u64).to_le_bytes());
+            }
+            RandomizerSpec::Perfect(commitment) => {
+                bytes.push(1);
+                match commitment.realization() {
+                    PerfectRandomizerRealization::EncodedOracleBundle { basis } => {
+                        bytes.push(0);
+                        bytes.extend_from_slice(basis.to_transcript_binding().canonical_bytes());
+                    }
+                    PerfectRandomizerRealization::NativeExtensionPcs => bytes.push(1),
+                }
+            }
+        }
+        TranscriptBinding::new(DOMAIN_BATCH_OPENING, bytes)
+    }
+}
+
+const fn security_level_discriminant(security_level: SecurityLevel) -> u8 {
+    match security_level {
+        SecurityLevel::Statistical => 0,
+        SecurityLevel::Perfect => 1,
+    }
+}
+
+const fn commitment_boundary_discriminant(boundary: CommitmentBoundary) -> u8 {
+    match boundary {
+        CommitmentBoundary::SharedPcsHook => 0,
+        CommitmentBoundary::DedicatedAuxiliaryPath => 1,
     }
 }
 

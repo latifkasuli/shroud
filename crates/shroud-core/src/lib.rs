@@ -11,9 +11,13 @@ mod surface;
 mod transcript;
 
 pub use binding::{
-    DOMAIN_BASIS, DOMAIN_DEGREE_CONTRACT, DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE,
-    DOMAIN_PUBLIC_OPENINGS, DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL,
-    TranscriptBindable, TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest,
+    DOMAIN_BASIS, DOMAIN_BATCH_OPENING, DOMAIN_CODEWORD_EMBEDDING, DOMAIN_DEGREE_BUDGET,
+    DOMAIN_DEGREE_CONTRACT, DOMAIN_HASH_ID, DOMAIN_HIDING_TECHNIQUE, DOMAIN_OPENING_PROJECTION,
+    DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS, DOMAIN_QUOTIENT_HIDER,
+    DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SAMPLED_CHALLENGE, DOMAIN_SECURITY_LEVEL, HashIdentifier,
+    PublicOpeningBinding, SampledChallenge, StandardBatchOpeningBindings, TranscriptBindable,
+    TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest,
+    TranscriptChallengeDeriver, transcript_stage_discriminant,
 };
 pub use claim::{
     BasisDescriptor, CoordinateOrder, FieldModel, PerfectClaim, PerfectClaimError, RandomnessModel,

@@ -251,11 +251,11 @@ impl ShroudOracleCommitmentSpec {
 }
 
 impl TranscriptBindable for ShroudOracleCommitmentSpec {
-    /// Encodes all five shape fields as u64 LE (40 bytes) followed by the
-    /// security-level discriminant (1 byte). Total: 41 bytes.
+    /// Encodes all five shape fields, derived payload counts, security level,
+    /// and auxiliary transport.
     fn to_transcript_binding(&self) -> TranscriptBinding {
         let shape = self.shape();
-        let mut bytes = Vec::with_capacity(41);
+        let mut bytes = Vec::with_capacity(74);
         bytes.extend_from_slice(&(shape.committed_oracles() as u64).to_le_bytes());
         bytes.extend_from_slice(&(shape.queried_rows() as u64).to_le_bytes());
         bytes.extend_from_slice(&(shape.row_width() as u64).to_le_bytes());
@@ -263,11 +263,28 @@ impl TranscriptBindable for ShroudOracleCommitmentSpec {
         bytes.extend_from_slice(
             &(shape.hidden_hiding_witness_items_per_query() as u64).to_le_bytes(),
         );
-        bytes.push(match self.security_level() {
-            SecurityLevel::Statistical => 0u8,
-            SecurityLevel::Perfect => 1u8,
-        });
+        let payload = self.payload();
+        bytes.extend_from_slice(&(payload.public_commitments() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.public_row_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.public_authentication_items() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.hidden_hiding_witness_items() as u64).to_le_bytes());
+        bytes.push(security_level_discriminant(self.security_level()));
+        bytes.push(auxiliary_transport_discriminant(self.auxiliary_transport()));
         TranscriptBinding::new(DOMAIN_ORACLE_COMMITMENT, bytes)
+    }
+}
+
+const fn security_level_discriminant(security_level: SecurityLevel) -> u8 {
+    match security_level {
+        SecurityLevel::Statistical => 0,
+        SecurityLevel::Perfect => 1,
+    }
+}
+
+const fn auxiliary_transport_discriminant(transport: OracleAuxiliaryTransport) -> u8 {
+    match transport {
+        OracleAuxiliaryTransport::InBandWithOpeningProof => 0,
+        OracleAuxiliaryTransport::SeparateAuxiliaryProof => 1,
     }
 }
 
@@ -382,9 +399,9 @@ mod tests {
             binding.domain_label(),
             shroud_core::DOMAIN_ORACLE_COMMITMENT
         );
-        assert_eq!(binding.canonical_bytes().len(), 41);
-        // statistical = 0x00 as last byte
-        assert_eq!(binding.canonical_bytes()[40], 0u8);
+        assert_eq!(binding.canonical_bytes().len(), 74);
+        // statistical = 0x00, in-band transport = 0x00 as final two bytes
+        assert_eq!(&binding.canonical_bytes()[72..], &[0u8, 0u8]);
     }
 
     #[test]

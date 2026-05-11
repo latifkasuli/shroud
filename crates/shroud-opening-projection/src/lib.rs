@@ -10,7 +10,9 @@
 
 use core::fmt;
 
-use shroud_core::SecurityLevel;
+use shroud_core::{
+    DOMAIN_OPENING_PROJECTION, SecurityLevel, TranscriptBindable, TranscriptBinding,
+};
 
 /// How hidden auxiliary opening material is carried through the outer proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +215,41 @@ impl ShroudOpeningProjectionSpec {
         }
 
         Ok(())
+    }
+}
+
+impl TranscriptBindable for ShroudOpeningProjectionSpec {
+    /// Encodes the complete opening-projection spec: security level, shape,
+    /// derived payload, and auxiliary transport.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::with_capacity(58);
+        bytes.push(security_level_discriminant(self.security_level()));
+        let shape = self.shape();
+        bytes.extend_from_slice(&(shape.public_opening_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.hidden_auxiliary_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.verifier_reconstruction_items() as u64).to_le_bytes());
+        let payload = self.payload();
+        bytes.extend_from_slice(&(payload.public_opening_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.hidden_auxiliary_values() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.verifier_reconstruction_items() as u64).to_le_bytes());
+        bytes.push(auxiliary_transport_discriminant(
+            payload.auxiliary_transport(),
+        ));
+        TranscriptBinding::new(DOMAIN_OPENING_PROJECTION, bytes)
+    }
+}
+
+const fn security_level_discriminant(security_level: SecurityLevel) -> u8 {
+    match security_level {
+        SecurityLevel::Statistical => 0,
+        SecurityLevel::Perfect => 1,
+    }
+}
+
+const fn auxiliary_transport_discriminant(transport: AuxiliaryOpeningTransport) -> u8 {
+    match transport {
+        AuxiliaryOpeningTransport::InBandWithMainProof => 0,
+        AuxiliaryOpeningTransport::SeparateAuxiliaryProof => 1,
     }
 }
 
