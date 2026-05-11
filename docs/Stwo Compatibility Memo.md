@@ -100,17 +100,21 @@ Verdict:
 
 This object depends on the exact quotient/reduction semantics of the backend.
 
-In SHROUD v1, the quotient layer is already decomposition-sensitive even before circle-STARK concerns appear.
+In SHROUD v1, the quotient layer is already decomposition-sensitive even before circle-STARK concerns appear. The spec now supports two algebraic masking shapes via `QuotientDegreeContract`:
 
-For Stwo, that means:
+- plain additive: `q_i(X) + r_i(X)`
+- vanishing-factor: `q_i(X) + v_{H_i}(X) · t_i(X)`, where `deg(v_{H_i}) + deg(t_i) ≤ deg(q_i)`
 
-- the quotient-hider cannot simply be imported
-- it would need a fresh statement against Stwo’s own reduction/arithmetic story
+The vanishing-factor shape is meaningful here. Circle-STARK quotient constructions naturally involve a vanishing polynomial of the circle domain, and hiding strategies that multiply a masking term by a vanishing polynomial factor appear in that setting. The `with_vanishing_poly` constructor can represent this algebraic shape without requiring a new type.
+
+That does not mean the quotient-hider transfers unchanged. The polynomial/domain model is still incompatible: circle-STARK quotients are stated against a circle-group domain, not a multiplicative coset over a prime field, and the degree accounting changes accordingly. A fresh statement is still required.
+
+But the key point is that `QuotientDegreeContract` is no longer restricted to plain-additive form, which was a structural mismatch. A SHROUD-Circle variant of this object would not need to introduce a new degree-contract type — it would use `with_vanishing_poly` to express the circle-specific invariant.
 
 Verdict:
 
 - high-level layer transfers
-- concrete object does not transfer unchanged
+- concrete object does not transfer unchanged, but the degree contract is now algebraically compatible with the vanishing-factor shape that circle-STARK quotient hiding requires
 
 ### 4. `ShroudBatchOpening`
 
@@ -155,7 +159,7 @@ Verdict:
 | --- | --- | --- |
 | `ShroudOracleCommitment` | Medium | Concept transfers, contract must be restated |
 | `ShroudCodewordEmbedding` | Low to medium | Hiding idea transfers, embedding construction is unclear |
-| `ShroudQuotientHider` | Low | Quotient semantics are backend-sensitive |
+| `ShroudQuotientHider` | Low to medium | Quotient semantics require a fresh circle-domain statement, but `QuotientDegreeContract.with_vanishing_poly` can represent the algebraic shape without a new type |
 | `ShroudBatchOpening` | Medium at the architectural level, low at the construction level | Layer survives, protocol needs circle-specific restatement |
 | `ShroudOpeningProjection` | High | Public/hidden opening split is generic |
 
@@ -187,6 +191,14 @@ This is the decisive question for whether `ShroudBatchOpening` becomes:
 4. Can the same public-vs-hidden opening projection model be preserved?
 
 If yes, SHROUD retains a strong cross-backend invariant even when the low-degree machinery changes.
+
+### What Does Not Need To Be Redesigned
+
+Two spec-layer types are already compatible enough to use without modification.
+
+`HidingTechniqueClaim` — the `BackendSpecific(String)` variant and `Composite(Box<Self>, Box<Self>)` provide a vocabulary for declaring circle-STARK hiding techniques without requiring new named variants in `shroud-core`. A SHROUD-Circle adapter can express any combination of Stwo-specific techniques as a `Composite` of `BackendSpecific` leaves. Named variants (`RandomCodewordInterleaving`, etc.) can be added to `shroud-core` later if a technique becomes common enough to warrant a formal name.
+
+`QuotientDegreeContract` — the `with_vanishing_poly` constructor supports the `q_i(X) + v_{H_i}(X) · t_i(X)` masking shape natively. A SHROUD-Circle quotient hider would supply the circle-domain vanishing polynomial degree as the `vanishing_poly_degree` argument and the masking polynomial degree as `randomizer_degree`. The combined invariant `deg(v_{H_i}) + deg(t_i) ≤ deg(q_i)` already matches what circle-STARK degree accounting would require.
 
 ## Recommended Next Artifact
 

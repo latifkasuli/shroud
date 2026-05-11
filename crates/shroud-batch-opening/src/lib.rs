@@ -358,7 +358,7 @@ pub trait PerfectRandomizerTranscript {
     type Error;
 
     /// Observe the perfect-randomizer commitment at the current transcript stage.
-    fn observe_perfect_randomizer_commitment<Commitment>(
+    fn observe_perfect_randomizer_commitment<Commitment: shroud_core::TranscriptBindable>(
         &mut self,
         commitment: &Commitment,
     ) -> Result<(), Self::Error>;
@@ -391,7 +391,10 @@ pub trait PerfectRandomizerBackend {
         &self,
         transcript: &mut T,
         commitment: &Self::Commitment,
-    ) -> Result<(), T::Error> {
+    ) -> Result<(), T::Error>
+    where
+        Self::Commitment: shroud_core::TranscriptBindable,
+    {
         transcript.observe_perfect_randomizer_commitment(commitment)
     }
 

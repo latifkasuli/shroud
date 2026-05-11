@@ -21,9 +21,30 @@ That makes RISC Zero a patch-driven partial-mapping target.
 | --- | --- | --- |
 | `ShroudOracleCommitment` | Patch-level | Some concerns may already be addressed, but not as a reusable layer |
 | `ShroudCodewordEmbedding` | Patch-level | Hiding logic is not yet surfaced as one protocol object |
-| `ShroudQuotientHider` | Patch-level or unclear | Would need explicit decomposition-aware treatment |
+| `ShroudQuotientHider` | Patch-level or unclear | Would need a `QuotientDegreeContract` identifying the algebraic masking shape and compatible degrees |
 | `ShroudBatchOpening` | Unclear | Missing as a named reusable object |
 | `ShroudOpeningProjection` | Unclear | Missing as an explicit public/hidden contract |
+
+## Impact of the Completed Spec Layer
+
+The SHROUD spec layer is now complete with two additions relevant to a future RISC Zero adapter.
+
+### `QuotientDegreeContract` and masking shape
+
+`ShroudQuotientHider` now requires a `QuotientDegreeContract` whenever degree-chunked decomposition is used. The contract supports two algebraic masking shapes:
+
+- plain additive: `q_i(X) + r_i(X)` — randomizer degree must not exceed chunk degree
+- vanishing-factor: `q_i(X) + v_{H_i}(X) · t_i(X)` — combined `deg(v_{H_i}) + deg(t_i)` must not exceed chunk degree
+
+A RISC Zero adapter would first need to identify which shape (if any) the existing quotient fixes implicitly use, then provide a degree contract that names the correct invariant. Without that, `validate()` will reject the spec.
+
+### `HidingTechniqueClaim` as a forcing function
+
+The spec layer now requires adapters to explicitly declare how hiding is achieved via `HidingTechniqueClaim`. For RISC Zero, where the hiding story is patch-driven rather than structured, the appropriate declaration would be `BackendSpecific("...")` claims naming each mechanism.
+
+This is intentionally a forcing function: it prevents a RISC Zero adapter from silently omitting a technique declaration. The audit-facing claim is a contract, not a runtime check — but `validate_for_spec` already enforces that at least `RandomCodewordInterleaving` is declared when the codeword-embedding layer is active. A RISC Zero adapter that uses a different Layer 1 equivalent must state that explicitly via `BackendSpecific`.
+
+The implication for the cataloging step in the first sensible path: each identified fix should map to a named or `BackendSpecific` `HidingTechniqueClaim`, and those claims should be organized into a `Composite` to represent the full hiding story.
 
 ## What SHROUD Would Mean Here
 

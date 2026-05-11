@@ -10,7 +10,7 @@
 
 use core::fmt;
 
-use shroud_core::SecurityLevel;
+use shroud_core::{DOMAIN_ORACLE_COMMITMENT, SecurityLevel, TranscriptBindable, TranscriptBinding};
 
 /// How row-hiding witness material is transported through the outer proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +250,27 @@ impl ShroudOracleCommitmentSpec {
     }
 }
 
+impl TranscriptBindable for ShroudOracleCommitmentSpec {
+    /// Encodes all five shape fields as u64 LE (40 bytes) followed by the
+    /// security-level discriminant (1 byte). Total: 41 bytes.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let shape = self.shape();
+        let mut bytes = Vec::with_capacity(41);
+        bytes.extend_from_slice(&(shape.committed_oracles() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.queried_rows() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.row_width() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.authentication_items_per_query() as u64).to_le_bytes());
+        bytes.extend_from_slice(
+            &(shape.hidden_hiding_witness_items_per_query() as u64).to_le_bytes(),
+        );
+        bytes.push(match self.security_level() {
+            SecurityLevel::Statistical => 0u8,
+            SecurityLevel::Perfect => 1u8,
+        });
+        TranscriptBinding::new(DOMAIN_ORACLE_COMMITMENT, bytes)
+    }
+}
+
 /// Error raised when an oracle-commitment object violates a SHROUD invariant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OracleCommitmentError {
@@ -305,7 +326,7 @@ mod tests {
         OracleAuxiliaryTransport, OracleCommitmentError, OracleCommitmentShape,
         ShroudOracleCommitmentSpec,
     };
-    use shroud_core::SecurityLevel;
+    use shroud_core::{SecurityLevel, TranscriptBindable};
 
     #[test]
     fn statistical_oracle_commitment_tracks_public_and_hidden_surface() {
@@ -346,5 +367,39 @@ mod tests {
             OracleCommitmentShape::new(1, 1, 4, 3, 0),
             Err(OracleCommitmentError::ZeroHiddenWitnessItemsPerQuery)
         );
+    }
+
+    #[test]
+    fn oracle_commitment_binding_encodes_shape_and_security_level() {
+        let shape = OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape");
+        let spec = ShroudOracleCommitmentSpec::statistical(
+            shape,
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid spec");
+        let binding = spec.to_transcript_binding();
+        assert_eq!(
+            binding.domain_label(),
+            shroud_core::DOMAIN_ORACLE_COMMITMENT
+        );
+        assert_eq!(binding.canonical_bytes().len(), 41);
+        // statistical = 0x00 as last byte
+        assert_eq!(binding.canonical_bytes()[40], 0u8);
+    }
+
+    #[test]
+    fn oracle_commitment_bindings_differ_by_security_level() {
+        let shape = OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape");
+        let stat = ShroudOracleCommitmentSpec::statistical(
+            shape,
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid");
+        let perf = ShroudOracleCommitmentSpec::perfect(
+            shape,
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid");
+        assert_ne!(stat.to_transcript_binding(), perf.to_transcript_binding());
     }
 }

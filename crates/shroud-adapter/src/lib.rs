@@ -621,8 +621,8 @@ mod tests {
         OracleAuxiliaryTransport, OracleCommitmentShape, ShroudOracleCommitmentSpec,
     };
     use shroud_quotient_hider::{
-        QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientHiderShape,
-        ShroudQuotientHiderSpec,
+        QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
+        QuotientHiderShape, ShroudQuotientHiderSpec,
     };
 
     #[test]
@@ -751,11 +751,13 @@ mod tests {
     #[test]
     fn quotient_hider_plan_tracks_family_budget_and_slots() {
         let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        let contract = QuotientDegreeContract::new(31, 31).expect("valid contract");
         let spec = ShroudQuotientHiderSpec::statistical(
             QuotientDecompositionFamily::DegreeChunked,
             8,
             shape,
             QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
         )
         .expect("valid spec");
         let payload = spec.payload();

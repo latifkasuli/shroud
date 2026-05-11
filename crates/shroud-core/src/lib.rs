@@ -3,16 +3,24 @@
 
 //! Shared protocol types for the SHROUD workspace.
 
+mod binding;
 mod claim;
 mod degree;
+mod hiding;
 mod surface;
 mod transcript;
 
+pub use binding::{
+    DOMAIN_BASIS, DOMAIN_DEGREE_CONTRACT, DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE,
+    DOMAIN_PUBLIC_OPENINGS, DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL,
+    TranscriptBindable, TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest,
+};
 pub use claim::{
     BasisDescriptor, CoordinateOrder, FieldModel, PerfectClaim, PerfectClaimError, RandomnessModel,
     ReconstructionRule, SimulatorObligations,
 };
 pub use degree::{DegreeBudget, DegreeBudgetError};
+pub use hiding::HidingTechniqueClaim;
 pub use surface::{AuxiliaryTransport, HiddenAuxiliarySurface, PublicSurface, QueryBudget};
 pub use transcript::{TranscriptPlan, TranscriptPlanError, TranscriptStage};
 

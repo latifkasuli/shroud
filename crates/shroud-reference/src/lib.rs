@@ -14,12 +14,16 @@ use shroud_adapter::{
 use shroud_batch_opening::{
     BatchOpeningShape, HiddenOpeningTransport, PerfectHiddenOpeningPayload,
     PerfectRandomizerAdapter, PerfectRandomizerAdapterSurface, PerfectRandomizerBackend,
-    PerfectRandomizerCommitment, PerfectRandomizerOpening, PerfectRandomizerReconstruction,
-    PerfectRandomizerTranscript, PreparedPerfectRandomizer, ProofSlotLayout,
-    RandomizerOpeningPayload, ShroudBatchOpeningSpec,
+    PerfectRandomizerCommitment, PerfectRandomizerOpening, PerfectRandomizerRealization,
+    PerfectRandomizerReconstruction, PerfectRandomizerTranscript, PreparedPerfectRandomizer,
+    ProofSlotLayout, RandomizerOpeningPayload, ShroudBatchOpeningSpec,
 };
 use shroud_codeword_embedding::ShroudCodewordEmbeddingSpec;
-use shroud_core::{AuxiliaryTransport, BasisDescriptor, TranscriptStage};
+use shroud_core::{
+    AuxiliaryTransport, BasisDescriptor, DOMAIN_PROFILE, DOMAIN_RANDOMIZER_COMMITMENT,
+    HidingTechniqueClaim, TranscriptBindable, TranscriptBinding, TranscriptBindingError,
+    TranscriptBindingManifest, TranscriptStage,
+};
 use shroud_opening_projection::{AuxiliaryOpeningTransport, ShroudOpeningProjectionSpec};
 use shroud_oracle_commitment::{OracleAuxiliaryTransport, ShroudOracleCommitmentSpec};
 use shroud_quotient_hider::{QuotientAuxiliaryTransport, ShroudQuotientHiderSpec};
@@ -29,13 +33,26 @@ use shroud_quotient_hider::{QuotientAuxiliaryTransport, ShroudQuotientHiderSpec}
 pub struct ReferenceTranscript<'a> {
     spec: &'a ShroudBatchOpeningSpec,
     cursor: usize,
+    record: ReferenceBindingRecord,
+    manifest: TranscriptBindingManifest,
 }
 
 impl<'a> ReferenceTranscript<'a> {
     /// Creates a transcript at the first stage of the supplied spec.
+    ///
+    /// `manifest` declares the exact [`TranscriptBinding`] values that must be
+    /// present in the record before each sampling stage may be entered. Pass
+    /// [`TranscriptBindingManifest::new`] when no exact-byte enforcement is needed
+    /// (e.g. pure stage-ordering tests). Pass a manifest built from concrete
+    /// spec objects to enforce Fiat-Shamir binding correctness.
     #[must_use]
-    pub fn new(spec: &'a ShroudBatchOpeningSpec) -> Self {
-        Self { spec, cursor: 0 }
+    pub fn new(spec: &'a ShroudBatchOpeningSpec, manifest: TranscriptBindingManifest) -> Self {
+        Self {
+            spec,
+            cursor: 0,
+            record: ReferenceBindingRecord::new(),
+            manifest,
+        }
     }
 
     /// Returns the next stage expected by the transcript, if any.
@@ -48,10 +65,35 @@ impl<'a> ReferenceTranscript<'a> {
             .copied()
     }
 
+    /// Returns a reference to the binding record for inspection.
+    #[must_use]
+    pub fn record(&self) -> &ReferenceBindingRecord {
+        &self.record
+    }
+
+    /// Returns a mutable reference to the binding record for absorbing bindings.
+    pub fn record_mut(&mut self) -> &mut ReferenceBindingRecord {
+        &mut self.record
+    }
+
     /// Advances the transcript by one stage.
     pub fn advance(&mut self, stage: TranscriptStage) -> Result<(), ReferenceTranscriptError> {
         match self.expected_stage() {
             Some(expected) if expected == stage => {
+                // Binding check fires only when the stage is correct
+                if let Err(e) = self
+                    .record
+                    .assert_exact_present(self.manifest.required_before(stage))
+                {
+                    let domain_label = match e {
+                        TranscriptBindingError::MissingBinding { domain_label }
+                        | TranscriptBindingError::BindingMismatch { domain_label } => domain_label,
+                    };
+                    return Err(ReferenceTranscriptError::MissingBindingBeforeStage {
+                        stage,
+                        domain_label,
+                    });
+                }
                 self.cursor += 1;
                 Ok(())
             }
@@ -71,7 +113,7 @@ impl<'a> ReferenceTranscript<'a> {
 }
 
 /// Error raised when the reference transcript violates the planned stage order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReferenceTranscriptError {
     /// The transcript observed a stage other than the one required next.
     UnexpectedStage {
@@ -82,6 +124,13 @@ pub enum ReferenceTranscriptError {
     },
     /// The transcript was advanced after it had already consumed every stage.
     AlreadyComplete,
+    /// A required binding was absent when a sampling stage was reached.
+    MissingBindingBeforeStage {
+        /// The sampling stage that required the binding.
+        stage: TranscriptStage,
+        /// The domain label that was absent.
+        domain_label: String,
+    },
 }
 
 impl fmt::Display for ReferenceTranscriptError {
@@ -94,20 +143,173 @@ impl fmt::Display for ReferenceTranscriptError {
                 )
             }
             Self::AlreadyComplete => write!(f, "transcript is already complete"),
+            Self::MissingBindingBeforeStage {
+                stage,
+                domain_label,
+            } => write!(
+                f,
+                "binding {domain_label:?} was not absorbed before reaching stage {stage}; \
+                 absorb it during the preceding observe stage to satisfy the Fiat-Shamir requirement"
+            ),
         }
     }
 }
 
 impl std::error::Error for ReferenceTranscriptError {}
 
+/// Records transcript binding events and enforces that all required bindings
+/// were absorbed before a challenge is sampled.
+///
+/// This is the SHROUD reference answer to the Fiat-Shamir completeness check.
+/// It does not replace the cryptographic hash — it tracks *which protocol
+/// parameters* were absorbed and fails loudly if any required binding is absent,
+/// catching the class of vulnerabilities described by incomplete transcript binding.
+///
+/// # Usage
+///
+/// ```rust
+/// # use shroud_reference::ReferenceBindingRecord;
+/// # use shroud_core::{SecurityLevel, TranscriptBindable};
+/// let mut record = ReferenceBindingRecord::new();
+/// record.absorb_bindable(&SecurityLevel::Statistical);
+/// // … absorb remaining required bindings …
+/// ```
+#[derive(Debug, Default)]
+pub struct ReferenceBindingRecord {
+    absorbed: Vec<TranscriptBinding>,
+}
+
+impl ReferenceBindingRecord {
+    /// Creates an empty binding record.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            absorbed: Vec::new(),
+        }
+    }
+
+    /// Absorbs a raw transcript binding into the record.
+    pub fn absorb(&mut self, binding: TranscriptBinding) {
+        self.absorbed.push(binding);
+    }
+
+    /// Absorbs the canonical binding for a [`TranscriptBindable`] protocol object.
+    pub fn absorb_bindable<T: TranscriptBindable>(&mut self, value: &T) {
+        self.absorb(value.to_transcript_binding());
+    }
+
+    /// Returns `true` if a binding with the given domain label was absorbed.
+    #[must_use]
+    pub fn contains_binding(&self, domain_label: &str) -> bool {
+        self.absorbed
+            .iter()
+            .any(|b| b.domain_label() == domain_label)
+    }
+
+    /// Returns `true` if a binding with the exact domain label AND canonical bytes was absorbed.
+    #[must_use]
+    pub fn contains_exact_binding(&self, expected: &TranscriptBinding) -> bool {
+        self.absorbed.iter().any(|b| {
+            b.domain_label() == expected.domain_label()
+                && b.canonical_bytes() == expected.canonical_bytes()
+        })
+    }
+
+    /// Returns all absorbed bindings in absorption order.
+    #[must_use]
+    pub fn absorbed(&self) -> &[TranscriptBinding] {
+        &self.absorbed
+    }
+
+    /// Checks that every label in `required_labels` was absorbed.
+    ///
+    /// Returns the first missing label as [`TranscriptBindingError::MissingBinding`].
+    pub fn assert_required_present(
+        &self,
+        required_labels: &[&str],
+    ) -> Result<(), TranscriptBindingError> {
+        for &label in required_labels {
+            if !self.contains_binding(label) {
+                return Err(TranscriptBindingError::MissingBinding {
+                    domain_label: label.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every binding in `expected` was absorbed with exact canonical bytes.
+    ///
+    /// Returns [`TranscriptBindingError::MissingBinding`] if no binding for the domain label
+    /// was absorbed at all, or [`TranscriptBindingError::BindingMismatch`] if a binding was
+    /// absorbed but its bytes differ from the expected value.
+    pub fn assert_exact_present(
+        &self,
+        expected: &[TranscriptBinding],
+    ) -> Result<(), TranscriptBindingError> {
+        for binding in expected {
+            if self.contains_exact_binding(binding) {
+                continue;
+            }
+            if self.contains_binding(binding.domain_label()) {
+                return Err(TranscriptBindingError::BindingMismatch {
+                    domain_label: binding.domain_label().to_string(),
+                });
+            }
+            return Err(TranscriptBindingError::MissingBinding {
+                domain_label: binding.domain_label().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Verifies that every expected binding declared by the manifest was absorbed
+    /// with the exact canonical bytes.
+    ///
+    /// Iterates over each sampling stage in the manifest and calls
+    /// [`Self::assert_exact_present`] for that stage's expected bindings. Returns
+    /// [`TranscriptBindingError::MissingBinding`] when a required label is absent,
+    /// or [`TranscriptBindingError::BindingMismatch`] when a binding for the right
+    /// label was absorbed but its canonical bytes differ from the expected value.
+    ///
+    /// This is the security-critical end-of-transcript validator. Use a manifest
+    /// derived from the concrete SHROUD spec plus backend profile/adapter plan.
+    pub fn finalize(
+        &self,
+        manifest: &TranscriptBindingManifest,
+    ) -> Result<(), TranscriptBindingError> {
+        for stage in [
+            TranscriptStage::SampleBatchingChallenge,
+            TranscriptStage::SampleOodPoint,
+            TranscriptStage::ProveMaskedRelation,
+        ] {
+            self.assert_exact_present(manifest.required_before(stage))?;
+        }
+        Ok(())
+    }
+}
+
 impl PerfectRandomizerTranscript for ReferenceTranscript<'_> {
     type Error = ReferenceTranscriptError;
 
-    fn observe_perfect_randomizer_commitment<Commitment>(
+    fn observe_perfect_randomizer_commitment<Commitment: TranscriptBindable>(
         &mut self,
-        _commitment: &Commitment,
+        commitment: &Commitment,
     ) -> Result<(), Self::Error> {
-        self.advance(TranscriptStage::ObserveRandomizerCommitment)
+        // Validate stage BEFORE mutating the record — a failed observe must not
+        // leave DOMAIN_RANDOMIZER_COMMITMENT bytes in the record, where they
+        // could later satisfy a downstream sampling gate.
+        match self.expected_stage() {
+            Some(TranscriptStage::ObserveRandomizerCommitment) => {
+                self.record.absorb_bindable(commitment);
+                self.advance(TranscriptStage::ObserveRandomizerCommitment)
+            }
+            Some(expected) => Err(ReferenceTranscriptError::UnexpectedStage {
+                expected,
+                observed: TranscriptStage::ObserveRandomizerCommitment,
+            }),
+            None => Err(ReferenceTranscriptError::AlreadyComplete),
+        }
     }
 }
 
@@ -143,6 +345,28 @@ impl ReferencePerfectRandomizerState {
     #[must_use]
     pub const fn shape(self) -> BatchOpeningShape {
         self.shape
+    }
+}
+
+impl TranscriptBindable for ReferencePerfectRandomizerCommitment {
+    /// Encodes the commitment model (realization discriminant + basis bytes if applicable)
+    /// followed by the batch-opening shape (3 × u64 LE). Domain: `DOMAIN_RANDOMIZER_COMMITMENT`.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::new();
+        match self.model().realization() {
+            PerfectRandomizerRealization::EncodedOracleBundle { basis } => {
+                bytes.push(0u8);
+                bytes.extend_from_slice(basis.to_transcript_binding().canonical_bytes());
+            }
+            PerfectRandomizerRealization::NativeExtensionPcs => {
+                bytes.push(1u8);
+            }
+        }
+        let shape = self.shape();
+        bytes.extend_from_slice(&(shape.committed_polynomials() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.opening_points() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(shape.extension_degree() as u64).to_le_bytes());
+        TranscriptBinding::new(DOMAIN_RANDOMIZER_COMMITMENT, bytes)
     }
 }
 
@@ -451,7 +675,7 @@ pub enum ReferencePlonky3CodewordHiddenAuxiliarySlot {
 /// `HidingFriPcs` fields are private; callers must declare the parameters they
 /// used when constructing it. The codeword-embedding adapter validates the SHROUD
 /// spec against this declared profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceHidingFriPcsProfile {
     /// `log_blowup` passed to the FRI parameters.
     pub log_blowup: usize,
@@ -463,6 +687,8 @@ pub struct ReferenceHidingFriPcsProfile {
     pub input_mmcs_hiding: bool,
     /// Whether the FRI query-phase MMCS is a hiding MMCS.
     pub fri_mmcs_hiding: bool,
+    /// Declared hiding techniques used by this backend configuration.
+    pub hiding_technique: HidingTechniqueClaim,
 }
 
 impl ReferenceHidingFriPcsProfile {
@@ -479,6 +705,13 @@ impl ReferenceHidingFriPcsProfile {
             basis: BasisDescriptor::plonky3_binomial(4),
             input_mmcs_hiding: true,
             fri_mmcs_hiding: true,
+            hiding_technique: HidingTechniqueClaim::Composite(
+                Box::new(HidingTechniqueClaim::Composite(
+                    Box::new(HidingTechniqueClaim::RandomCodewordInterleaving),
+                    Box::new(HidingTechniqueClaim::QuotientChunkRandomization),
+                )),
+                Box::new(HidingTechniqueClaim::RandomRowPadding),
+            ),
         }
     }
 
@@ -490,6 +723,15 @@ impl ReferenceHidingFriPcsProfile {
         &self,
         spec: &ShroudCodewordEmbeddingSpec,
     ) -> Result<(), ReferenceCodewordEmbeddingAdapterError> {
+        if !self
+            .hiding_technique
+            .contains(&HidingTechniqueClaim::RandomCodewordInterleaving)
+        {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::RandomCodewordInterleavingNotDeclared,
+            );
+        }
+
         if !self.input_mmcs_hiding || !self.fri_mmcs_hiding {
             return Err(ReferenceCodewordEmbeddingAdapterError::NonHidingMmcs);
         }
@@ -514,7 +756,37 @@ impl ReferenceHidingFriPcsProfile {
             );
         }
 
+        let spec_extension_degree = spec.shape().extension_degree();
+        if self.basis.extension_degree != spec_extension_degree {
+            return Err(
+                ReferenceCodewordEmbeddingAdapterError::ExtensionDegreeMismatch {
+                    profile: self.basis.extension_degree,
+                    spec: spec_extension_degree,
+                },
+            );
+        }
+
         Ok(())
+    }
+}
+
+impl TranscriptBindable for ReferenceHidingFriPcsProfile {
+    /// Encodes `log_blowup`, `num_random_codewords`, and `basis.extension_degree`
+    /// as u64 LE (24 bytes), followed by `input_mmcs_hiding` and `fri_mmcs_hiding`
+    /// as single bytes (2 bytes), then a u32 LE length prefix followed by the
+    /// canonical bytes of the hiding technique claim tree.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&(self.log_blowup as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.num_random_codewords as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.basis.extension_degree as u64).to_le_bytes());
+        bytes.push(self.input_mmcs_hiding as u8);
+        bytes.push(self.fri_mmcs_hiding as u8);
+        // Encode the hiding technique claim tree
+        let technique_bytes = self.hiding_technique.to_canonical_bytes();
+        bytes.extend_from_slice(&(technique_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&technique_bytes);
+        TranscriptBinding::new(DOMAIN_PROFILE, bytes)
     }
 }
 
@@ -562,6 +834,23 @@ pub enum ReferenceCodewordEmbeddingAdapterError {
     UnsupportedAuxiliaryTransport,
     /// The profile declares a non-hiding input or FRI MMCS, which cannot provide ZK.
     NonHidingMmcs,
+    /// The profile's `hiding_technique` does not declare `RandomCodewordInterleaving`.
+    ///
+    /// Codeword embedding requires random codewords to be interleaved with the witness
+    /// matrix. A profile that does not declare this technique cannot validate a
+    /// codeword-embedding spec.
+    RandomCodewordInterleavingNotDeclared,
+    /// The profile's basis extension degree does not match the spec's extension degree.
+    ///
+    /// `BasisDescriptor::extension_degree` is the audit surface for coordinate reconstruction.
+    /// A mismatch means the declared profile and the SHROUD spec describe incompatible
+    /// challenge field configurations.
+    ExtensionDegreeMismatch {
+        /// Extension degree declared in the profile.
+        profile: usize,
+        /// Extension degree required by the SHROUD spec.
+        spec: usize,
+    },
 }
 
 impl fmt::Display for ReferenceCodewordEmbeddingAdapterError {
@@ -606,6 +895,17 @@ impl fmt::Display for ReferenceCodewordEmbeddingAdapterError {
                 f,
                 "profile declares a non-hiding MMCS; both input_mmcs_hiding and fri_mmcs_hiding \
                  must be true to provide zero-knowledge"
+            ),
+            Self::RandomCodewordInterleavingNotDeclared => write!(
+                f,
+                "profile hiding_technique does not declare RandomCodewordInterleaving; \
+                 codeword embedding requires random codewords interleaved with the witness matrix"
+            ),
+            Self::ExtensionDegreeMismatch { profile, spec } => write!(
+                f,
+                "extension degree mismatch: profile declares degree {profile}, \
+                 spec requires degree {spec}; basis extension degree is the audit surface \
+                 for challenge-field coordinate reconstruction"
             ),
         }
     }
@@ -769,6 +1069,23 @@ pub enum ReferenceQuotientHiderAdapterError {
         /// Slot actually supplied.
         observed: ReferencePlonky3QuotientHiddenAuxiliarySlot,
     },
+    /// The degree contract does not satisfy the Haböck-Kindi quotient degree relation required
+    /// by `HidingFriPcs`: for chunk degree `h - 1`, the coset vanishing polynomial has degree
+    /// `h`, the mask polynomial has degree `h - 1`, and the committed bound is `2h - 1`.
+    ///
+    /// Required: `vanishing_poly_degree == quotient_chunk_degree + 1`,
+    /// `mask_poly_degree == quotient_chunk_degree`, and
+    /// `randomized_chunk_degree_bound == quotient_chunk_degree + vanishing_poly_degree`.
+    HKDegreeRelationViolation {
+        /// Declared original chunk degree (`h - 1`).
+        quotient_chunk_degree: usize,
+        /// Declared vanishing polynomial degree; expected `quotient_chunk_degree + 1`.
+        vanishing_poly_degree: usize,
+        /// Declared mask polynomial degree; expected `quotient_chunk_degree`.
+        mask_poly_degree: usize,
+        /// Declared committed degree bound; expected `quotient_chunk_degree + vanishing_poly_degree`.
+        randomized_chunk_degree_bound: usize,
+    },
 }
 
 impl fmt::Display for ReferenceQuotientHiderAdapterError {
@@ -790,6 +1107,27 @@ impl fmt::Display for ReferenceQuotientHiderAdapterError {
                 f,
                 "quotient hidden auxiliary slot mismatch: expected {expected:?}, observed {observed:?}"
             ),
+            Self::HKDegreeRelationViolation {
+                quotient_chunk_degree,
+                vanishing_poly_degree,
+                mask_poly_degree,
+                randomized_chunk_degree_bound,
+            } => {
+                let expected_vanishing = quotient_chunk_degree + 1;
+                let expected_mask = quotient_chunk_degree;
+                let expected_bound = quotient_chunk_degree + expected_vanishing;
+                write!(
+                    f,
+                    "HidingFriPcs requires Haböck-Kindi quotient degree relation: \
+                     vanishing_poly_degree = quotient_chunk_degree + 1 = {expected_vanishing}, \
+                     mask_poly_degree = quotient_chunk_degree = {expected_mask}, \
+                     randomized_chunk_degree_bound = quotient_chunk_degree + vanishing_poly_degree \
+                     = {expected_bound}; \
+                     got vanishing_poly_degree = {vanishing_poly_degree}, \
+                     mask_poly_degree = {mask_poly_degree}, \
+                     randomized_chunk_degree_bound = {randomized_chunk_degree_bound}"
+                )
+            }
         }
     }
 }
@@ -1355,6 +1693,30 @@ impl OracleCommitmentAdapter for ReferenceLayeredAdapter {
     }
 }
 
+/// Checks that `contract` satisfies the Haböck-Kindi quotient degree relation used by
+/// `HidingFriPcs`: vanishing_poly_degree = chunk + 1, mask_poly_degree = chunk,
+/// committed bound = chunk + vanishing = 2*chunk + 1.
+fn check_hk_quotient_degree_relation(
+    contract: &shroud_quotient_hider::QuotientDegreeContract,
+) -> Result<(), ReferenceQuotientHiderAdapterError> {
+    let d = contract.quotient_chunk_degree();
+    if contract.vanishing_poly_degree() == d + 1
+        && contract.mask_poly_degree() == d
+        && contract.randomized_chunk_degree_bound() == d + contract.vanishing_poly_degree()
+    {
+        Ok(())
+    } else {
+        Err(
+            ReferenceQuotientHiderAdapterError::HKDegreeRelationViolation {
+                quotient_chunk_degree: d,
+                vanishing_poly_degree: contract.vanishing_poly_degree(),
+                mask_poly_degree: contract.mask_poly_degree(),
+                randomized_chunk_degree_bound: contract.randomized_chunk_degree_bound(),
+            },
+        )
+    }
+}
+
 impl QuotientHiderAdapter for ReferencePlonky3Adapter {
     type CommitmentSlot = ReferencePlonky3QuotientCommitmentSlot;
     type PublicOpeningSlot = ReferencePlonky3QuotientOpeningSlot;
@@ -1372,6 +1734,14 @@ impl QuotientHiderAdapter for ReferencePlonky3Adapter {
         >,
         Self::Error,
     > {
+        if matches!(
+            spec.decomposition_family(),
+            shroud_quotient_hider::QuotientDecompositionFamily::DegreeChunked
+        ) && let Some(contract) = spec.degree_contract()
+        {
+            check_hk_quotient_degree_relation(&contract)?;
+        }
+
         let hidden_auxiliary_slot = match spec.auxiliary_transport() {
             QuotientAuxiliaryTransport::InBandWithOpeningProof => {
                 ReferencePlonky3QuotientHiddenAuxiliarySlot::FriOpeningProofInternals
@@ -1401,6 +1771,15 @@ impl QuotientHiderAdapter for ReferencePlonky3Adapter {
             Self::HiddenAuxiliarySlot,
         >,
     ) -> Result<(), Self::Error> {
+        // Enforce the full Haböck-Kindi quotient degree relation (same check as plan()).
+        if matches!(
+            spec.decomposition_family(),
+            shroud_quotient_hider::QuotientDecompositionFamily::DegreeChunked
+        ) && let Some(contract) = spec.degree_contract()
+        {
+            check_hk_quotient_degree_relation(&contract)?;
+        }
+
         if *plan.commitment_slot()
             != ReferencePlonky3QuotientCommitmentSlot::QuotientCommitmentField
         {
@@ -1915,23 +2294,24 @@ impl CodewordEmbeddingAdapter for ReferencePlonky3Adapter {
 mod tests {
     use super::{
         REFERENCE_LOG_BLOWUP, REFERENCE_NUM_RANDOM_CODEWORDS, ReferenceAdapterError,
-        ReferenceCodewordEmbeddingAdapterError, ReferenceHidingFriPcsProfile,
-        ReferenceLayeredAdapter, ReferenceLayeredAdapterError, ReferenceLayeredCommitmentCarrier,
-        ReferenceLayeredHiddenAuxiliaryCarrier, ReferenceLayeredOracleCommitmentAdapterError,
-        ReferenceLayeredOracleCommitmentCarrier, ReferenceLayeredOracleHiddenAuxiliaryCarrier,
-        ReferenceLayeredOracleOpeningCarrier, ReferenceLayeredProjectionAdapterError,
-        ReferenceLayeredPublicOpeningCarrier, ReferenceLayeredQuotientCommitmentCarrier,
-        ReferenceLayeredQuotientHiddenAuxiliaryCarrier, ReferenceLayeredQuotientHiderAdapterError,
-        ReferenceLayeredQuotientOpeningCarrier, ReferenceOracleCommitmentAdapterError,
-        ReferencePerfectRandomizerBackend, ReferencePerfectRandomizerError,
-        ReferencePlonky3Adapter, ReferencePlonky3CodewordCommitmentSlot,
-        ReferencePlonky3CodewordHiddenAuxiliarySlot, ReferencePlonky3CodewordPublicOpeningSlot,
-        ReferencePlonky3CommitmentSlot, ReferencePlonky3HiddenAuxiliarySlot,
-        ReferencePlonky3OracleCommitmentSlot, ReferencePlonky3OracleHiddenAuxiliarySlot,
-        ReferencePlonky3OracleOpeningSlot, ReferencePlonky3PublicOpeningSlot,
-        ReferencePlonky3QuotientCommitmentSlot, ReferencePlonky3QuotientHiddenAuxiliarySlot,
-        ReferencePlonky3QuotientOpeningSlot, ReferenceProjectionAdapterError,
-        ReferenceQuotientHiderAdapterError, ReferenceTranscript, ReferenceTranscriptError,
+        ReferenceBindingRecord, ReferenceCodewordEmbeddingAdapterError,
+        ReferenceHidingFriPcsProfile, ReferenceLayeredAdapter, ReferenceLayeredAdapterError,
+        ReferenceLayeredCommitmentCarrier, ReferenceLayeredHiddenAuxiliaryCarrier,
+        ReferenceLayeredOracleCommitmentAdapterError, ReferenceLayeredOracleCommitmentCarrier,
+        ReferenceLayeredOracleHiddenAuxiliaryCarrier, ReferenceLayeredOracleOpeningCarrier,
+        ReferenceLayeredProjectionAdapterError, ReferenceLayeredPublicOpeningCarrier,
+        ReferenceLayeredQuotientCommitmentCarrier, ReferenceLayeredQuotientHiddenAuxiliaryCarrier,
+        ReferenceLayeredQuotientHiderAdapterError, ReferenceLayeredQuotientOpeningCarrier,
+        ReferenceOracleCommitmentAdapterError, ReferencePerfectRandomizerBackend,
+        ReferencePerfectRandomizerError, ReferencePlonky3Adapter,
+        ReferencePlonky3CodewordCommitmentSlot, ReferencePlonky3CodewordHiddenAuxiliarySlot,
+        ReferencePlonky3CodewordPublicOpeningSlot, ReferencePlonky3CommitmentSlot,
+        ReferencePlonky3HiddenAuxiliarySlot, ReferencePlonky3OracleCommitmentSlot,
+        ReferencePlonky3OracleHiddenAuxiliarySlot, ReferencePlonky3OracleOpeningSlot,
+        ReferencePlonky3PublicOpeningSlot, ReferencePlonky3QuotientCommitmentSlot,
+        ReferencePlonky3QuotientHiddenAuxiliarySlot, ReferencePlonky3QuotientOpeningSlot,
+        ReferenceProjectionAdapterError, ReferenceQuotientHiderAdapterError, ReferenceTranscript,
+        ReferenceTranscriptError,
     };
     use shroud_adapter::{
         BatchOpeningAdapter, BatchOpeningAdapterPlan, CodewordEmbeddingAdapter,
@@ -1945,7 +2325,12 @@ mod tests {
         PerfectRandomizerReconstruction, ProofSlotLayout, ShroudBatchOpeningSpec,
     };
     use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
-    use shroud_core::{AuxiliaryTransport, BasisDescriptor, SecurityLevel, TranscriptStage};
+    use shroud_core::{
+        AuxiliaryTransport, BasisDescriptor, DOMAIN_BASIS, DOMAIN_DEGREE_CONTRACT,
+        DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS,
+        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, SecurityLevel, TranscriptBindable,
+        TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest, TranscriptStage,
+    };
     use shroud_opening_projection::{
         AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
     };
@@ -1953,15 +2338,15 @@ mod tests {
         OracleAuxiliaryTransport, OracleCommitmentShape, ShroudOracleCommitmentSpec,
     };
     use shroud_quotient_hider::{
-        QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientHiderShape,
-        ShroudQuotientHiderSpec,
+        QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
+        QuotientHiderShape, ShroudQuotientHiderSpec,
     };
 
     #[test]
     fn accepts_the_standard_statistical_flow() {
         let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
         let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
-        let mut transcript = ReferenceTranscript::new(&spec);
+        let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
 
         for stage in spec.transcript_plan().stages() {
             transcript
@@ -1983,7 +2368,7 @@ mod tests {
             )),
         )
         .expect("valid spec");
-        let mut transcript = ReferenceTranscript::new(&spec);
+        let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
 
         transcript
             .advance(TranscriptStage::ObserveMainCommitments)
@@ -2005,6 +2390,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_observe_does_not_pollute_binding_record() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::perfect(
+            shape,
+            15,
+            PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
+                2,
+            )),
+        )
+        .expect("valid spec");
+        let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
+
+        let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(2),
+        );
+        let prepared = backend.commit(&spec).expect("commit should succeed");
+
+        // Cursor is at ObserveMainCommitments. Observing the randomizer here is out of order.
+        let err = backend
+            .observe(&mut transcript, prepared.commitment())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ReferenceTranscriptError::UnexpectedStage { .. }
+        ));
+
+        // CRITICAL: the failed observe must not have absorbed the commitment binding,
+        // otherwise a later sampling gate could be satisfied by stale bytes.
+        assert!(
+            !transcript
+                .record()
+                .contains_binding(DOMAIN_RANDOMIZER_COMMITMENT),
+            "failed observe leaked DOMAIN_RANDOMIZER_COMMITMENT into the record"
+        );
+    }
+
+    #[test]
     fn encoded_backend_round_trips_through_commit_observe_open_and_reconstruct() {
         let shape = BatchOpeningShape::new(5, 2, 3).expect("valid shape");
         let spec = ShroudBatchOpeningSpec::perfect(
@@ -2020,7 +2442,7 @@ mod tests {
         );
         let prepared = backend.commit(&spec).expect("commit should succeed");
 
-        let mut transcript = ReferenceTranscript::new(&spec);
+        let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
         transcript
             .advance(TranscriptStage::ObserveMainCommitments)
             .expect("first stage should be accepted");
@@ -2034,6 +2456,7 @@ mod tests {
         backend
             .observe(&mut transcript, prepared.commitment())
             .expect("observation should succeed");
+        // After observe, DOMAIN_RANDOMIZER_COMMITMENT is now in the record
         assert_eq!(
             transcript.expected_stage(),
             Some(TranscriptStage::SampleOodPoint)
@@ -2640,11 +3063,16 @@ mod tests {
     #[test]
     fn plonky3_quotient_adapter_maps_statistical_quotient_in_band() {
         let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        // HidingFriPcs uses q'_i = q_i + v_H_i * t_i. For chunk degree h-1=31:
+        //   vanishing_poly_degree = h = 32, mask_poly_degree = h-1 = 31, committed bound = 2h-1 = 63.
+        let contract =
+            QuotientDegreeContract::with_vanishing_poly(31, 32, 31, 63).expect("valid contract");
         let spec = ShroudQuotientHiderSpec::statistical(
             QuotientDecompositionFamily::DegreeChunked,
             8,
             shape,
             QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2680,6 +3108,7 @@ mod tests {
             6,
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+            None,
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2702,6 +3131,7 @@ mod tests {
             6,
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+            None,
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2731,11 +3161,13 @@ mod tests {
     #[test]
     fn layered_quotient_adapter_maps_statistical_quotient_to_opening_envelope() {
         let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        let contract = QuotientDegreeContract::new(31, 31).expect("valid contract");
         let spec = ShroudQuotientHiderSpec::statistical(
             QuotientDecompositionFamily::DegreeChunked,
             8,
             shape,
             QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2766,6 +3198,7 @@ mod tests {
             6,
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+            None,
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2788,6 +3221,7 @@ mod tests {
             6,
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+            None,
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2972,6 +3406,555 @@ mod tests {
         assert_eq!(
             profile.validate_for_spec(&spec),
             Err(ReferenceCodewordEmbeddingAdapterError::NonHidingMmcs)
+        );
+    }
+
+    #[test]
+    fn profile_validate_for_spec_rejects_missing_random_codeword_technique() {
+        use shroud_core::HidingTechniqueClaim;
+        let profile = ReferenceHidingFriPcsProfile {
+            hiding_technique: HidingTechniqueClaim::RandomRowPadding,
+            ..ReferenceHidingFriPcsProfile::standard()
+        };
+        let shape = CodewordEmbeddingShape::new(
+            8,
+            profile.num_random_codewords,
+            profile.log_blowup + 1,
+            profile.basis.extension_degree,
+        )
+        .expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+
+        assert_eq!(
+            profile.validate_for_spec(&spec),
+            Err(ReferenceCodewordEmbeddingAdapterError::RandomCodewordInterleavingNotDeclared)
+        );
+    }
+
+    #[test]
+    fn profile_validate_for_spec_rejects_extension_degree_mismatch() {
+        use shroud_core::BasisDescriptor;
+        let profile = ReferenceHidingFriPcsProfile {
+            basis: BasisDescriptor::plonky3_binomial(2),
+            num_random_codewords: 4,
+            ..ReferenceHidingFriPcsProfile::standard()
+        };
+        // Spec declares extension_degree = 4; profile declares degree = 2.
+        let shape =
+            CodewordEmbeddingShape::new(8, 4, profile.log_blowup + 1, 4).expect("valid shape");
+        let spec = ShroudCodewordEmbeddingSpec::statistical(shape).expect("valid spec");
+
+        assert_eq!(
+            profile.validate_for_spec(&spec),
+            Err(
+                ReferenceCodewordEmbeddingAdapterError::ExtensionDegreeMismatch {
+                    profile: 2,
+                    spec: 4,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_plan_rejects_wrong_hk_degree_relation() {
+        let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        // Plain-additive: vanishing_poly_degree = 0, expected = quotient_chunk_degree + 1 = 32.
+        let contract = QuotientDegreeContract::new(31, 31).expect("valid contract");
+        let spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            shape,
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        // plan() itself must reject — not just validate().
+        assert_eq!(
+            QuotientHiderAdapter::plan(&adapter, &spec),
+            Err(
+                ReferenceQuotientHiderAdapterError::HKDegreeRelationViolation {
+                    quotient_chunk_degree: 31,
+                    vanishing_poly_degree: 0,
+                    mask_poly_degree: 31,
+                    randomized_chunk_degree_bound: 31,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_rejects_malformed_vanishing_factor_contract() {
+        let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        // vanishing_poly_degree = 1 (nonzero) but not quotient_chunk_degree + 1 = 16.
+        let contract =
+            QuotientDegreeContract::with_vanishing_poly(15, 1, 1, 15).expect("valid contract");
+        let spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            shape,
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+
+        assert_eq!(
+            QuotientHiderAdapter::plan(&adapter, &spec),
+            Err(
+                ReferenceQuotientHiderAdapterError::HKDegreeRelationViolation {
+                    quotient_chunk_degree: 15,
+                    vanishing_poly_degree: 1,
+                    mask_poly_degree: 1,
+                    randomized_chunk_degree_bound: 15,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn plonky3_quotient_adapter_accepts_exact_hk_degree_relation() {
+        let shape = QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape");
+        // Exact HK relation: chunk=15, vanishing=16=chunk+1, mask=15=chunk, bound=31=chunk+vanishing.
+        let contract =
+            QuotientDegreeContract::with_vanishing_poly(15, 16, 15, 31).expect("valid contract");
+        let spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            shape,
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(contract),
+        )
+        .expect("valid spec");
+        let adapter = ReferencePlonky3Adapter;
+        let plan =
+            QuotientHiderAdapter::plan(&adapter, &spec).expect("exact HK relation should plan");
+
+        QuotientHiderAdapter::validate(&adapter, &spec, &plan)
+            .expect("exact HK relation should validate");
+    }
+
+    #[cfg(feature = "plonky3-prototype")]
+    #[test]
+    fn plonky3_prototype_profile_matches_pinned_backend() {
+        crate::plonky3_prototype::assert_profile_matches_backend();
+    }
+
+    #[cfg(feature = "plonky3-prototype")]
+    #[test]
+    fn plonky3_prototype_deterministic_config_builds() {
+        let _config = crate::plonky3_prototype::HidingBackend::deterministic_config(42);
+    }
+
+    // ── Transcript binding tests ─────────────────────────────────────────────────
+
+    fn build_complete_finalize_state() -> (TranscriptBindingManifest, ReferenceBindingRecord) {
+        use shroud_quotient_hider::QuotientDegreeContract;
+
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let basis = BasisDescriptor::plonky3_binomial(4);
+        let oracle = ShroudOracleCommitmentSpec::statistical(
+            OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid shape"),
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid oracle spec");
+        let security = SecurityLevel::Statistical;
+        let contract =
+            QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid contract");
+        let randomizer_binding =
+            TranscriptBinding::new(DOMAIN_RANDOMIZER_COMMITMENT, vec![0xAB; 16]);
+        let public_openings_binding = TranscriptBinding::new(DOMAIN_PUBLIC_OPENINGS, vec![0xCD; 8]);
+
+        let manifest = TranscriptBindingManifest::new()
+            .with_before_batching_challenge(profile.to_transcript_binding())
+            .with_before_batching_challenge(basis.to_transcript_binding())
+            .with_before_batching_challenge(oracle.to_transcript_binding())
+            .with_before_batching_challenge(security.to_transcript_binding())
+            .with_before_ood_point(contract.to_transcript_binding())
+            .with_before_ood_point(randomizer_binding.clone())
+            .with_before_prove_masked(public_openings_binding.clone());
+
+        let mut record = ReferenceBindingRecord::new();
+        record.absorb_bindable(&profile);
+        record.absorb_bindable(&basis);
+        record.absorb_bindable(&oracle);
+        record.absorb_bindable(&security);
+        record.absorb_bindable(&contract);
+        record.absorb(randomizer_binding);
+        record.absorb(public_openings_binding);
+
+        (manifest, record)
+    }
+
+    #[test]
+    fn complete_binding_record_finalizes_successfully() {
+        let (manifest, record) = build_complete_finalize_state();
+        assert!(record.finalize(&manifest).is_ok());
+    }
+
+    #[test]
+    fn missing_profile_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_PROFILE);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_PROFILE.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_basis_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record.absorbed.retain(|b| b.domain_label() != DOMAIN_BASIS);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_BASIS.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_oracle_commitment_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_ORACLE_COMMITMENT);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_ORACLE_COMMITMENT.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_randomizer_commitment_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_RANDOMIZER_COMMITMENT);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_RANDOMIZER_COMMITMENT.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_degree_contract_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_DEGREE_CONTRACT);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_DEGREE_CONTRACT.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_security_level_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_SECURITY_LEVEL);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_SECURITY_LEVEL.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_public_openings_binding_fails_finalize() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        record
+            .absorbed
+            .retain(|b| b.domain_label() != DOMAIN_PUBLIC_OPENINGS);
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_PUBLIC_OPENINGS.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_bytes_for_typed_binding_fails_finalize_with_mismatch() {
+        let (manifest, mut record) = build_complete_finalize_state();
+        // Remove the correct basis binding and absorb a different (degree-2) one
+        record.absorbed.retain(|b| b.domain_label() != DOMAIN_BASIS);
+        record.absorb_bindable(&BasisDescriptor::plonky3_binomial(2));
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::BindingMismatch {
+                domain_label: DOMAIN_BASIS.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_domain_label_does_not_satisfy_requirement() {
+        let mut record = ReferenceBindingRecord::new();
+        // Absorb a binding with the wrong label for DOMAIN_BASIS
+        record.absorb(TranscriptBinding::new("SHROUD_V1_WRONG_LABEL", vec![0x01]));
+        assert!(!record.contains_binding(DOMAIN_BASIS));
+        assert!(record.assert_required_present(&[DOMAIN_BASIS]).is_err());
+    }
+
+    #[test]
+    fn profile_binding_encodes_log_blowup_and_randomizers() {
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let binding = profile.to_transcript_binding();
+        assert_eq!(binding.domain_label(), DOMAIN_PROFILE);
+        // Binding is now longer than 26 bytes (includes technique bytes)
+        assert!(binding.canonical_bytes().len() > 26);
+        // First 8 bytes = log_blowup=2 as u64 LE
+        assert_eq!(&binding.canonical_bytes()[..8], &2u64.to_le_bytes());
+        // Next 8 bytes = num_random_codewords=4 as u64 LE
+        assert_eq!(&binding.canonical_bytes()[8..16], &4u64.to_le_bytes());
+        // Next 8 bytes = basis.extension_degree=4 as u64 LE
+        assert_eq!(&binding.canonical_bytes()[16..24], &4u64.to_le_bytes());
+        // bytes 24..26 = input_mmcs_hiding=1, fri_mmcs_hiding=1
+        assert_eq!(&binding.canonical_bytes()[24..26], &[1u8, 1u8]);
+        // After byte 26: 4-byte length prefix for technique bytes, then technique bytes
+        let technique_bytes = profile.hiding_technique.to_canonical_bytes();
+        let len_bytes = (technique_bytes.len() as u32).to_le_bytes();
+        assert_eq!(&binding.canonical_bytes()[26..30], &len_bytes);
+        assert_eq!(&binding.canonical_bytes()[30..], &technique_bytes[..]);
+    }
+
+    #[test]
+    fn different_profiles_produce_different_bindings() {
+        let standard = ReferenceHidingFriPcsProfile::standard();
+        let mut modified = ReferenceHidingFriPcsProfile::standard();
+        modified.log_blowup = 3;
+        assert_ne!(
+            standard.to_transcript_binding(),
+            modified.to_transcript_binding()
+        );
+    }
+
+    #[test]
+    fn absorb_bindable_uses_correct_domain_for_security_level() {
+        let mut record = ReferenceBindingRecord::new();
+        record.absorb_bindable(&SecurityLevel::Statistical);
+        assert!(record.contains_binding(DOMAIN_SECURITY_LEVEL));
+    }
+
+    // ── Stage-scoped binding enforcement tests ───────────────────────────────────
+
+    #[test]
+    fn advance_to_sampling_stage_fails_without_required_bindings() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+
+        // Build a manifest that requires the standard profile before SampleBatchingChallenge
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let manifest = TranscriptBindingManifest::new()
+            .with_before_batching_challenge(profile.to_transcript_binding());
+
+        let mut transcript = ReferenceTranscript::new(&spec, manifest);
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("observe main ok");
+        // Do NOT absorb the profile — exact-byte check must fail
+        let err = transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReferenceTranscriptError::MissingBindingBeforeStage { .. }
+            ),
+            "expected MissingBindingBeforeStage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn advance_to_ood_point_fails_without_randomizer_commitment_binding() {
+        use shroud_quotient_hider::QuotientDegreeContract;
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+
+        // Require a specific degree contract before SampleOodPoint
+        let contract = QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid");
+        let manifest = TranscriptBindingManifest::new()
+            .with_before_ood_point(contract.to_transcript_binding());
+
+        let mut transcript = ReferenceTranscript::new(&spec, manifest);
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("ok");
+        transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .expect("ok");
+        transcript
+            .advance(TranscriptStage::ObserveQuotientCommitments)
+            .expect("ok");
+        transcript
+            .advance(TranscriptStage::ObserveRandomizerCommitment)
+            .expect("ok");
+        // Do NOT absorb degree contract — exact-byte check must fail
+        let err = transcript
+            .advance(TranscriptStage::SampleOodPoint)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReferenceTranscriptError::MissingBindingBeforeStage { .. }
+            ),
+            "expected MissingBindingBeforeStage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn advance_fails_on_binding_byte_mismatch() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let manifest = TranscriptBindingManifest::new()
+            .with_before_batching_challenge(profile.to_transcript_binding());
+
+        let mut transcript = ReferenceTranscript::new(&spec, manifest);
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("ok");
+
+        // Absorb a profile binding with WRONG bytes (different log_blowup)
+        let mut wrong_profile = ReferenceHidingFriPcsProfile::standard();
+        wrong_profile.log_blowup = 3;
+        transcript.record_mut().absorb_bindable(&wrong_profile);
+
+        let err = transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReferenceTranscriptError::MissingBindingBeforeStage { .. }
+            ),
+            "expected MissingBindingBeforeStage on byte mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn advance_passes_when_exact_binding_is_absorbed() {
+        let shape = BatchOpeningShape::new(4, 1, 2).expect("valid shape");
+        let spec = ShroudBatchOpeningSpec::statistical(shape, 15).expect("valid spec");
+
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let manifest = TranscriptBindingManifest::new()
+            .with_before_batching_challenge(profile.to_transcript_binding());
+
+        let mut transcript = ReferenceTranscript::new(&spec, manifest);
+        transcript
+            .advance(TranscriptStage::ObserveMainCommitments)
+            .expect("ok");
+
+        // Absorb the correct binding
+        transcript.record_mut().absorb_bindable(&profile);
+
+        transcript
+            .advance(TranscriptStage::SampleBatchingChallenge)
+            .expect("exact binding should satisfy the gate");
+    }
+
+    // ── Exact-bytes validation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn assert_exact_present_rejects_wrong_bytes_for_same_label() {
+        let mut record = ReferenceBindingRecord::new();
+        // Absorb a basis binding with wrong bytes (degree 2 instead of 4)
+        record.absorb_bindable(&BasisDescriptor::plonky3_binomial(2));
+        // Expect degree-4 binding
+        let expected = BasisDescriptor::plonky3_binomial(4).to_transcript_binding();
+        assert_eq!(
+            record.assert_exact_present(&[expected]),
+            Err(TranscriptBindingError::BindingMismatch {
+                domain_label: DOMAIN_BASIS.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn assert_exact_present_accepts_matching_bytes() {
+        let mut record = ReferenceBindingRecord::new();
+        record.absorb_bindable(&BasisDescriptor::plonky3_binomial(4));
+        let expected = BasisDescriptor::plonky3_binomial(4).to_transcript_binding();
+        assert!(record.assert_exact_present(&[expected]).is_ok());
+    }
+
+    #[test]
+    fn assert_exact_present_returns_missing_when_no_binding_for_label() {
+        let record = ReferenceBindingRecord::new();
+        let expected = BasisDescriptor::plonky3_binomial(4).to_transcript_binding();
+        assert_eq!(
+            record.assert_exact_present(&[expected]),
+            Err(TranscriptBindingError::MissingBinding {
+                domain_label: DOMAIN_BASIS.to_string(),
+            })
+        );
+    }
+
+    // ── Profile technique encoding tests ─────────────────────────────────────────
+
+    #[test]
+    fn profiles_with_different_techniques_produce_different_bindings() {
+        use shroud_core::HidingTechniqueClaim;
+        let a = ReferenceHidingFriPcsProfile::standard();
+        let mut b = ReferenceHidingFriPcsProfile::standard();
+        b.hiding_technique = HidingTechniqueClaim::RandomCodewordInterleaving;
+        assert_ne!(a.to_transcript_binding(), b.to_transcript_binding());
+    }
+}
+
+/// Prototype integration bridge: SHROUD profiles against the pinned `p3-zk-proofs` backend.
+///
+/// This module is only present when the `plonky3-prototype` feature is enabled.
+/// It re-exports key backend types and provides an alignment check that verifies
+/// `ReferenceHidingFriPcsProfile::standard()` still matches the pinned backend's constants.
+#[cfg(feature = "plonky3-prototype")]
+pub mod plonky3_prototype {
+    pub use p3_zk_proofs::backend::{HidingBackend, HidingConfig};
+
+    /// Asserts that `ReferenceHidingFriPcsProfile::standard()` matches the constants
+    /// documented and used by `HidingBackend` in the pinned `p3-zk-proofs` crate.
+    ///
+    /// Call this from tests to catch drift when the pinned revision is updated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any profile field disagrees with the backend constants.
+    pub fn assert_profile_matches_backend() {
+        use crate::ReferenceHidingFriPcsProfile;
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        // Constants from p3-zk-proofs/src/backend.rs (private there, documented here):
+        //   LOG_BLOWUP_HIDING = 2
+        //   NUM_RANDOMIZER_COLS = 4
+        //   Challenge = BinomialExtensionField<BabyBear, 4>  →  extension_degree = 4
+        assert_eq!(
+            profile.log_blowup, 2,
+            "log_blowup drifted from backend LOG_BLOWUP_HIDING"
+        );
+        assert_eq!(
+            profile.num_random_codewords, 4,
+            "num_random_codewords drifted from backend NUM_RANDOMIZER_COLS"
+        );
+        assert_eq!(
+            profile.basis.extension_degree, 4,
+            "basis extension degree drifted from backend BinomialExtensionField<BabyBear, 4>"
         );
     }
 }
