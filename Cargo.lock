@@ -890,7 +890,12 @@ name = "shroud-plonky3"
 version = "0.1.0"
 dependencies = [
  "p3-zk-proofs",
+ "shroud-batch-opening",
+ "shroud-codeword-embedding",
  "shroud-core",
+ "shroud-opening-projection",
+ "shroud-oracle-commitment",
+ "shroud-quotient-hider",
  "shroud-reference",
 ]
 

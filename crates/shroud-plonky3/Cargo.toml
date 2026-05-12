@@ -14,5 +14,12 @@ shroud-reference = { path = "../shroud-reference" }
 git = "https://github.com/latifkasuli/p3-zk-proofs.git"
 rev = "d0c9fbc54e2314a90edd6a6ef84055c1179a4754"
 
+[dev-dependencies]
+shroud-batch-opening = { path = "../shroud-batch-opening" }
+shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
+shroud-opening-projection = { path = "../shroud-opening-projection" }
+shroud-oracle-commitment = { path = "../shroud-oracle-commitment" }
+shroud-quotient-hider = { path = "../shroud-quotient-hider" }
+
 [lib]
 path = "src/lib.rs"

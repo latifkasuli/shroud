@@ -45,6 +45,16 @@ pub use p3_zk_proofs::backend::{HidingBackend, HidingConfig};
 use shroud_core::{HashIdentifier, HidingTechniqueClaim, TranscriptBindable, TranscriptBinding};
 use shroud_reference::ReferenceHidingFriPcsProfile;
 
+pub mod extended_bindings;
+
+pub use extended_bindings::{
+    DOMAIN_PLONKY3_AIR_PUBLIC_VALUES, DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS,
+    DOMAIN_PLONKY3_FRI_FINAL_POLY, DOMAIN_PLONKY3_FRI_LOG_ARITIES, DOMAIN_PLONKY3_LOG_DEGREE,
+    DOMAIN_PLONKY3_LOG_EXT_DEGREE, DOMAIN_PLONKY3_OPENED_VALUES,
+    DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT, DOMAIN_PLONKY3_PREPROCESSED_WIDTH,
+    DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT, Plonky3UniStarkBindings,
+};
+
 // ── Pinned backend constants ─────────────────────────────────────────────────
 
 /// Pinned backend constant: `LOG_BLOWUP_HIDING` in `p3-zk-proofs::backend`.
