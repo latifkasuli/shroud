@@ -103,7 +103,9 @@ The `shroud-plonky3` crate pins constants the verifier re-derives independently 
 - `verify_profile_matches_backend(profile)` takes no version argument. The advisory check fires first — before any profile drift check — because without a patched hash, every other check is built on quicksand.
 - An earlier API exposed a `p3_symmetric: P3SymmetricVersion` parameter, which let callers declare a patched version against an unpatched graph. That trust hole is closed by removing the parameter.
 
-**Current state (intentionally surfaced):** the workspace resolves `p3-symmetric = 0.5.2` from `crates.io` (registry). `verify_profile_matches_backend` therefore returns `BackendDriftError::UnpatchedSymmetric` with a `Registry` provenance for every profile, and `assert_profile_matches_backend()` panics with the advisory message. This is honest — the bridge is not production-safe until the pinned dep is upgraded. The test `pinned_state_is_currently_unpatched_per_advisory` asserts the current state and fails when the upgrade lands, triggering a sweep of related `#[should_panic]` tests.
+**Current state.** The workspace `[patch.crates-io]` block redirects `p3-symmetric` to the reviewed `latifkasuli/p3-symmetric-patched` fork at commit `1bb34116a17674de8a49dc496e7d136804d2c15d`, which applies the upstream [`Pad10Sponge` patch](https://github.com/Plonky3/Plonky3/commit/5c1dc1d64c0516a8911bbf3ea40f173c21d6ae47) on top of the crates.io `0.5.2` source. `PINNED_P3_SYMMETRIC_PROVENANCE` now resolves to `Git { version: 0.5.2, source_url: "https://github.com/latifkasuli/p3-symmetric-patched.git", rev: "1bb34116..." }`, and the resolved `(source_url, rev)` matches `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`. The advisory gate passes; `verify_profile_matches_backend(&ReferenceHidingFriPcsProfile::standard())` returns `Ok(())`. Tests `pinned_state_is_patched_via_allowlist`, `check_advisory_passes_on_patched_stack`, `verify_profile_matches_backend_passes_on_patched_stack`, `assert_profile_matches_backend_succeeds_on_patched_stack`, and `known_patched_sources_allowlist_pins_audit_reviewed_entry` lock the patched-state invariants — any drift (allowlist edit, fork force-push, upstream registry release) fails CI loudly.
+
+**When upstream publishes a patched registry release** (`p3-symmetric > 0.5.2`): remove the `[patch.crates-io]` block from root `Cargo.toml`, remove the entry from `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`, and update the patched-state tests to expect `Registry { version: 0.5.3+ }` provenance. The gate will pass via the Registry-version path instead of the Git-allowlist path.
 
 #### Provenance gate — two acceptable paths to "patched"
 
@@ -125,14 +127,14 @@ pub enum P3SymmetricProvenance {
 
 **Source-conflation defense.** Pointing `p3-zk-proofs` at a Plonky3 commit with the `Pad10Sponge` patch does NOT change `p3-symmetric`'s own resolved source — Cargo still pulls `p3-symmetric` from `crates.io` unless an explicit `[patch.crates-io]` redirect targets `p3-symmetric` itself. The provenance gate therefore inspects `p3-symmetric`'s own entry, never `p3-zk-proofs`'s revision. This closes the trap of "the bridge crate is on a patched commit therefore the underlying hash must be patched."
 
-**Allowlist hygiene.** `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES` is intentionally empty in production. Each future entry requires:
+**Allowlist hygiene.** `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES` currently contains exactly one reviewed temporary git source: `latifkasuli/p3-symmetric-patched` at commit `1bb34116a17674de8a49dc496e7d136804d2c15d`. Each future entry or edit requires:
 
 - the upstream commit URL in the PR description,
 - a one-paragraph review of the `p3-symmetric` diff confirming it closes the advisory,
 - a co-sign from someone other than the bumper,
 - a `[patch.crates-io]` redirect in workspace `Cargo.toml` actually pointing `p3-symmetric` at the reviewed commit.
 
-The `known_patched_sources_allowlist_starts_empty` test fails when entries are added — CI failure is the trigger to re-review what was added and why. The `verify_provenance_*` tests exercise the gate logic with synthetic provenance + allowlist values: Registry-version-bump path, Git-allowlist-match path, matching-URL-wrong-rev rejection, matching-rev-wrong-URL rejection, and rejection of unallowlisted Git sources even when they self-declare a patched-looking version.
+The `known_patched_sources_allowlist_pins_audit_reviewed_entry` test fails when the entry changes — CI failure is the trigger to re-review what was added or edited and why. The `verify_provenance_*` tests exercise the gate logic with synthetic provenance + allowlist values: Registry-version-bump path, Git-allowlist-match path, matching-URL-wrong-rev rejection, matching-rev-wrong-URL rejection, and rejection of unallowlisted Git sources even when they self-declare a patched-looking version.
 
 ---
 

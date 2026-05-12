@@ -532,8 +532,7 @@ dependencies = [
 [[package]]
 name = "p3-symmetric"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c60a71a1507c13611b0f2b0b6e83669fd5b76f8e3115bcbced5ccfdf3ca7807"
+source = "git+https://github.com/latifkasuli/p3-symmetric-patched.git?rev=1bb34116a17674de8a49dc496e7d136804d2c15d#1bb34116a17674de8a49dc496e7d136804d2c15d"
 dependencies = [
  "itertools",
  "p3-field",
@@ -889,6 +888,10 @@ dependencies = [
 name = "shroud-plonky3"
 version = "0.1.0"
 dependencies = [
+ "p3-baby-bear",
+ "p3-challenger",
+ "p3-field",
+ "p3-keccak",
  "p3-zk-proofs",
  "shroud-batch-opening",
  "shroud-codeword-embedding",

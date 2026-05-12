@@ -47,6 +47,7 @@ use shroud_core::{HashIdentifier, HidingTechniqueClaim, TranscriptBindable, Tran
 use shroud_reference::ReferenceHidingFriPcsProfile;
 
 pub mod extended_bindings;
+pub mod recording_challenger;
 
 pub use extended_bindings::{
     DOMAIN_PLONKY3_AIR_PUBLIC_VALUES, DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS,
@@ -54,6 +55,12 @@ pub use extended_bindings::{
     DOMAIN_PLONKY3_LOG_EXT_DEGREE, DOMAIN_PLONKY3_OPENED_VALUES,
     DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT, DOMAIN_PLONKY3_PREPROCESSED_WIDTH,
     DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT, Plonky3UniStarkBindings,
+};
+pub use recording_challenger::{
+    ByteRecorder, PinnedByteChallenger, PinnedByteHash, PinnedRecordingByteChallenger,
+    PinnedRecordingChallenger, RecorderSnapshot, RecordingByteChallenger,
+    new_pinned_control_challenger, new_pinned_recording_byte_challenger,
+    new_pinned_recording_challenger,
 };
 
 // ── Pinned backend constants ─────────────────────────────────────────────────
@@ -293,7 +300,35 @@ pub const PINNED_P3_SYMMETRIC_VERSION: P3SymmetricVersion =
 /// hatch for cases where that release has not landed.
 ///
 /// [GHSA-3g92-f9ch-qjcm]: https://github.com/Plonky3/Plonky3/security/advisories/GHSA-3g92-f9ch-qjcm
-pub const KNOWN_PATCHED_P3_SYMMETRIC_SOURCES: &[(&str, &str)] = &[];
+pub const KNOWN_PATCHED_P3_SYMMETRIC_SOURCES: &[(&str, &str)] = &[
+    // ── Entry 1: `latifkasuli/p3-symmetric-patched` rev `1bb34116` ────────────
+    //
+    // Upstream patch source:
+    //   https://github.com/Plonky3/Plonky3/commit/5c1dc1d64c0516a8911bbf3ea40f173c21d6ae47
+    //
+    // The upstream commit introduces `Pad10Sponge` (the 10*1 padding rule) on
+    // `symmetric/src/sponge.rs`. This closes GHSA-3g92-f9ch-qjcm by ensuring
+    // that absorptions of different input lengths produce different sponge
+    // states even when one is a prefix of another.
+    //
+    // The fork (`latifkasuli/p3-symmetric-patched`) branches from the
+    // crates.io `p3-symmetric 0.5.2` source and applies ONLY this upstream
+    // patch. Sibling crates (`p3-field`, `p3-util`, etc.) are unchanged at
+    // their `0.5.2` registry versions, so `cargo tree -d | rg '^p3-'`
+    // returns no duplicate `p3-*` identities — the patch is surgical.
+    //
+    // Audit obligation per `docs/security-model.md §4`:
+    //   - Upstream commit URL above is the source of truth for the patch diff.
+    //   - The fork commit hash below MUST be the exact reviewed commit; any
+    //     force-push or rebase invalidates this entry.
+    //   - The workspace `[patch.crates-io]` block in root `Cargo.toml` must
+    //     reference the same (url, rev) pair as this allowlist entry —
+    //     mismatches cause `verify_provenance` to reject at build time.
+    (
+        "https://github.com/latifkasuli/p3-symmetric-patched.git",
+        "1bb34116a17674de8a49dc496e7d136804d2c15d",
+    ),
+];
 
 // ── BackendDriftError + verification ─────────────────────────────────────────
 
@@ -744,40 +779,54 @@ mod tests {
     use super::*;
     use shroud_core::BasisDescriptor;
 
-    // ── PINNED_P3_SYMMETRIC_VERSION + check_advisory ─────────────────────────
+    // ── PINNED_P3_SYMMETRIC_PROVENANCE + check_advisory ──────────────────────
 
-    /// This test documents the *current* state of the workspace and forces a
-    /// review when the pinned dep is upgraded.
+    /// The workspace is patched via a `[patch.crates-io]` redirect to a
+    /// reviewed git source. This test asserts the provenance reflects that
+    /// — `Git { .. }`, not `Registry { .. }` — and that the resolved source
+    /// is in the allowlist.
     ///
-    /// When the underlying `p3-zk-proofs` revision is bumped to a stack that
-    /// resolves `p3-symmetric >= 0.6`, this test will fail. That failure is
-    /// the trigger to:
-    ///   - flip every `#[should_panic]` test below to a regular assertion;
-    ///   - delete this test;
-    ///   - update `docs/security-model.md` §4 to remove the "currently
-    ///     unpatched" disclaimer.
+    /// If this test fails after a future `cargo update`, the patched fork
+    /// rev or URL has drifted from what `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`
+    /// records. Re-review the new commit and update the allowlist entry.
     #[test]
-    fn pinned_state_is_currently_unpatched_per_advisory() {
-        assert!(
-            !PINNED_P3_SYMMETRIC_VERSION.is_patched(),
-            "pinned p3-symmetric is now patched ({PINNED_P3_SYMMETRIC_VERSION}); \
-             flip should_panic tests, delete this test, and update the security model doc"
-        );
+    fn pinned_state_is_patched_via_allowlist() {
+        match PINNED_P3_SYMMETRIC_PROVENANCE {
+            P3SymmetricProvenance::Git {
+                source_url, rev, ..
+            } => {
+                let in_allowlist = KNOWN_PATCHED_P3_SYMMETRIC_SOURCES
+                    .iter()
+                    .any(|(u, r)| *u == source_url && *r == rev);
+                assert!(
+                    in_allowlist,
+                    "resolved p3-symmetric ({source_url} @ {rev}) is not in \
+                     KNOWN_PATCHED_P3_SYMMETRIC_SOURCES; re-review the new \
+                     commit and update the allowlist or revert the patch"
+                );
+            }
+            P3SymmetricProvenance::Registry { version, .. } => {
+                // Acceptable iff version > LAST_AFFECTED (e.g., upstream
+                // shipped 0.5.3+). If so, the [patch.crates-io] redirect in
+                // root Cargo.toml is no longer needed and should be removed.
+                assert!(
+                    version.is_patched(),
+                    "p3-symmetric reverted to Registry but version ({version}) is \
+                     not strictly greater than LAST_AFFECTED ({}); \
+                     bridge is unsafe — restore the [patch.crates-io] redirect",
+                    P3SymmetricVersion::LAST_AFFECTED
+                );
+            }
+        }
     }
 
     #[test]
-    fn check_advisory_currently_returns_unpatched() {
-        let err = check_advisory().expect_err("unpatched stack must fail advisory check");
-        match err {
-            BackendDriftError::UnpatchedSymmetric {
-                provenance,
-                last_affected,
-            } => {
-                assert_eq!(provenance, PINNED_P3_SYMMETRIC_PROVENANCE);
-                assert_eq!(last_affected, P3SymmetricVersion::LAST_AFFECTED);
-            }
-            other => panic!("expected UnpatchedSymmetric, got {other:?}"),
-        }
+    fn check_advisory_passes_on_patched_stack() {
+        check_advisory().expect(
+            "patched stack must pass the advisory gate; if this fails, \
+             either the [patch.crates-io] redirect or the allowlist entry \
+             has drifted from the resolved p3-symmetric source",
+        );
     }
 
     // ── Provenance gate — Registry vs Git, allowlist match ──────────────────
@@ -892,15 +941,25 @@ mod tests {
         assert!(verify_provenance(prov, &[(url, rev)]).is_ok());
     }
 
+    /// The allowlist currently authorizes the `latifkasuli/p3-symmetric-patched`
+    /// fork at the reviewed `Pad10Sponge` commit. This test pins that exact
+    /// entry so any future allowlist change (additions, removals, force-pushes)
+    /// fails CI — forcing a co-signed audit review per `docs/security-model.md §4`.
+    ///
+    /// When upstream publishes a patched `p3-symmetric` registry release
+    /// (`> 0.5.2`), this entry should be removed alongside the
+    /// `[patch.crates-io]` redirect in the workspace `Cargo.toml`.
     #[test]
-    fn known_patched_sources_allowlist_starts_empty() {
-        // Audit hygiene: the production allowlist must be empty until a real
-        // patched source is reviewed. CI failure here is the trigger to
-        // re-review what was added and why.
-        assert!(
-            KNOWN_PATCHED_P3_SYMMETRIC_SOURCES.is_empty(),
-            "allowlist contains {} entries; each must be audit-justified per docs/security-model.md §4",
-            KNOWN_PATCHED_P3_SYMMETRIC_SOURCES.len()
+    fn known_patched_sources_allowlist_pins_audit_reviewed_entry() {
+        assert_eq!(
+            KNOWN_PATCHED_P3_SYMMETRIC_SOURCES,
+            &[(
+                "https://github.com/latifkasuli/p3-symmetric-patched.git",
+                "1bb34116a17674de8a49dc496e7d136804d2c15d",
+            )],
+            "allowlist has drifted from the audit-reviewed entry; \
+             re-review the new (url, rev) per docs/security-model.md §4 \
+             before updating this test",
         );
     }
 
@@ -953,19 +1012,24 @@ mod tests {
     }
 
     #[test]
-    fn verify_profile_matches_backend_currently_blocks_on_advisory() {
-        // Even with a perfect profile, the advisory check fires first.
+    fn verify_profile_matches_backend_passes_on_patched_stack() {
+        // The standard profile + patched p3-symmetric source must pass both
+        // the advisory check AND every profile-drift check. This is the
+        // green-light invariant for production bridge setup.
         let profile = ReferenceHidingFriPcsProfile::standard();
-        let err = verify_profile_matches_backend(&profile).expect_err("unpatched stack must fail");
-        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+        verify_profile_matches_backend(&profile).expect(
+            "standard profile must pass on patched stack; if this fails, \
+             either the [patch.crates-io] redirect, the allowlist entry, \
+             or one of the pinned backend constants has drifted",
+        );
     }
 
     #[test]
-    #[should_panic(expected = "GHSA-3g92-f9ch-qjcm")]
-    fn assert_profile_matches_backend_panics_under_current_unpatched_state() {
-        // This is the canonical bridge-setup invariant. While the stack is
-        // unpatched, calling it MUST panic with the advisory reason. When the
-        // stack is upgraded, drop the should_panic attribute.
+    fn assert_profile_matches_backend_succeeds_on_patched_stack() {
+        // Direct call must not panic when the stack is patched. The
+        // function is the canonical bridge-setup invariant — production
+        // code calls it once during startup; a panic here is the signal
+        // that the bridge cannot proceed safely.
         assert_profile_matches_backend();
     }
 

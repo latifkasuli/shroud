@@ -9,12 +9,20 @@ build = "build.rs"
 [dependencies]
 shroud-core = { path = "../shroud-core" }
 shroud-reference = { path = "../shroud-reference" }
+# Plonky3 transitively-pinned via p3-zk-proofs; declared directly so the
+# RecordingByteChallenger module can import the trait surface without
+# routing every type alias through p3_zk_proofs::backend.
+p3-baby-bear = "0.5.2"
+p3-challenger = "0.5.2"
+p3-keccak = "0.5.2"
 
 [dependencies.p3-zk-proofs]
 git = "https://github.com/latifkasuli/p3-zk-proofs.git"
 rev = "d0c9fbc54e2314a90edd6a6ef84055c1179a4754"
 
 [dev-dependencies]
+# Test-only: extension-field arithmetic for transparency tests.
+p3-field = "0.5.2"
 shroud-batch-opening = { path = "../shroud-batch-opening" }
 shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
 shroud-opening-projection = { path = "../shroud-opening-projection" }

@@ -18,3 +18,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/latifkasuli/shroud"
 rust-version = "1.95"
 version = "0.1.0"
+
+# Redirect `p3-symmetric` to a reviewed git fork that contains the upstream
+# `Pad10Sponge` padding fix for GHSA-3g92-f9ch-qjcm. The fork branches from
+# the crates.io `p3-symmetric 0.5.2` source and applies only the upstream
+# patch from Plonky3 commit 5c1dc1d64c0516a8911bbf3ea40f173c21d6ae47, so the
+# rest of the `p3-* 0.5.2` ecosystem still resolves from crates.io and no
+# duplicate `p3-*` identities appear in the dependency graph.
+#
+# This (url, rev) pair MUST match `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES` in
+# `crates/shroud-plonky3/src/lib.rs`. The advisory gate refuses to start if
+# the resolved p3-symmetric source is not in the allowlist.
+#
+# Remove this redirect (and the allowlist entry) when crates.io publishes a
+# patched p3-symmetric release (`> 0.5.2`).
+[patch.crates-io]
+p3-symmetric = { git = "https://github.com/latifkasuli/p3-symmetric-patched.git", rev = "1bb34116a17674de8a49dc496e7d136804d2c15d" }
