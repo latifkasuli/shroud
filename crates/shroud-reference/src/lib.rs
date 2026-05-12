@@ -3688,17 +3688,7 @@ mod tests {
             .expect("exact HK relation should validate");
     }
 
-    #[cfg(feature = "plonky3-prototype")]
-    #[test]
-    fn plonky3_prototype_profile_matches_pinned_backend() {
-        crate::plonky3_prototype::assert_profile_matches_backend();
-    }
-
-    #[cfg(feature = "plonky3-prototype")]
-    #[test]
-    fn plonky3_prototype_deterministic_config_builds() {
-        let _config = crate::plonky3_prototype::HidingBackend::deterministic_config(42);
-    }
+    // Plonky3-prototype profile/config tests live in the `shroud-plonky3` crate.
 
     // ── Transcript binding tests ─────────────────────────────────────────────────
 
@@ -3846,6 +3836,61 @@ mod tests {
         );
     }
 
+    /// Locks the per-stage binding sequence emitted by
+    /// `TranscriptBindingManifest::standard_for_batch_opening`. This is the
+    /// canonical source of truth cited by `docs/security-model.md §7`. If a
+    /// future refactor reorders `standard_for_batch_opening`, this test fails
+    /// loudly instead of silently drifting from the prose in the doc.
+    #[test]
+    fn standard_manifest_per_stage_label_sequence_is_canonical() {
+        use shroud_core::{
+            DOMAIN_BASIS, DOMAIN_BATCH_OPENING, DOMAIN_CODEWORD_EMBEDDING, DOMAIN_DEGREE_CONTRACT,
+            DOMAIN_HASH_ID, DOMAIN_OPENING_PROJECTION, DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE,
+            DOMAIN_PUBLIC_OPENINGS, DOMAIN_QUOTIENT_HIDER, DOMAIN_RANDOMIZER_COMMITMENT,
+            DOMAIN_SECURITY_LEVEL,
+        };
+
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+
+        let labels_for = |stage| {
+            manifest
+                .required_before(stage)
+                .iter()
+                .map(TranscriptBinding::domain_label)
+                .collect::<Vec<_>>()
+        };
+
+        // Before SampleBatchingChallenge: hash-id, profile, basis, then the
+        // five protocol-object specs in declaration order, then security level.
+        assert_eq!(
+            labels_for(TranscriptStage::SampleBatchingChallenge),
+            vec![
+                DOMAIN_HASH_ID,
+                DOMAIN_PROFILE,
+                DOMAIN_BASIS,
+                DOMAIN_BATCH_OPENING,
+                DOMAIN_CODEWORD_EMBEDDING,
+                DOMAIN_ORACLE_COMMITMENT,
+                DOMAIN_OPENING_PROJECTION,
+                DOMAIN_QUOTIENT_HIDER,
+                DOMAIN_SECURITY_LEVEL,
+            ]
+        );
+
+        // Before SampleOodPoint: degree contract first, then concrete randomizer commitment.
+        assert_eq!(
+            labels_for(TranscriptStage::SampleOodPoint),
+            vec![DOMAIN_DEGREE_CONTRACT, DOMAIN_RANDOMIZER_COMMITMENT]
+        );
+
+        // Before ProveMaskedRelation: public openings.
+        assert_eq!(
+            labels_for(TranscriptStage::ProveMaskedRelation),
+            vec![DOMAIN_PUBLIC_OPENINGS]
+        );
+    }
+
     #[test]
     fn complete_binding_record_finalizes_successfully() {
         let (manifest, record) = build_complete_finalize_state();
@@ -3969,6 +4014,50 @@ mod tests {
         record.absorb(TranscriptBinding::new("SHROUD_V1_WRONG_LABEL", vec![0x01]));
         assert!(!record.contains_binding(DOMAIN_BASIS));
         assert!(record.assert_required_present(&[DOMAIN_BASIS]).is_err());
+    }
+
+    #[test]
+    fn cross_protocol_substitution_at_oracle_label_fails_finalize() {
+        // Threat model §2: an attacker provides "looks-valid" bytes (a real
+        // codeword-embedding spec binding) but wraps them under the oracle-
+        // commitment domain label. The manifest must catch this as a
+        // BindingMismatch — domain-label-vs-bytes substitution is the cross-
+        // protocol confusion attack class.
+        let fixture = standard_manifest_fixture();
+        let manifest = standard_manifest_from_fixture(&fixture);
+
+        // Build the cross-protocol attack binding: codeword spec's canonical
+        // bytes wearing the oracle-commitment domain label.
+        let codeword_bytes = fixture
+            .codeword_spec
+            .to_transcript_binding()
+            .canonical_bytes()
+            .to_vec();
+        let cross_protocol_binding =
+            TranscriptBinding::new(DOMAIN_ORACLE_COMMITMENT, codeword_bytes);
+
+        // Build a record with every legitimate binding EXCEPT the oracle slot,
+        // which gets the cross-protocol binding.
+        let mut record = ReferenceBindingRecord::new();
+        record.absorb_bindable(&fixture.hash_identifier);
+        record.absorb_bindable(&fixture.profile);
+        record.absorb_bindable(&fixture.basis);
+        record.absorb_bindable(&fixture.batch_spec);
+        record.absorb_bindable(&fixture.codeword_spec);
+        record.absorb(cross_protocol_binding); // attacker move
+        record.absorb_bindable(&fixture.projection_spec);
+        record.absorb_bindable(&fixture.quotient_spec);
+        record.absorb_bindable(&fixture.batch_spec.security_level());
+        record.absorb_bindable(&fixture.degree_contract);
+        record.absorb_bindable(&fixture.randomizer_commitment);
+        record.absorb_bindable(&fixture.public_openings);
+
+        assert_eq!(
+            record.finalize(&manifest),
+            Err(TranscriptBindingError::BindingMismatch {
+                domain_label: DOMAIN_ORACLE_COMMITMENT.to_string(),
+            })
+        );
     }
 
     #[test]
@@ -4328,44 +4417,5 @@ mod tests {
         let mut b = ReferenceHidingFriPcsProfile::standard();
         b.hiding_technique = HidingTechniqueClaim::RandomCodewordInterleaving;
         assert_ne!(a.to_transcript_binding(), b.to_transcript_binding());
-    }
-}
-
-/// Prototype integration bridge: SHROUD profiles against the pinned `p3-zk-proofs` backend.
-///
-/// This module is only present when the `plonky3-prototype` feature is enabled.
-/// It re-exports key backend types and provides an alignment check that verifies
-/// `ReferenceHidingFriPcsProfile::standard()` still matches the pinned backend's constants.
-#[cfg(feature = "plonky3-prototype")]
-pub mod plonky3_prototype {
-    pub use p3_zk_proofs::backend::{HidingBackend, HidingConfig};
-
-    /// Asserts that `ReferenceHidingFriPcsProfile::standard()` matches the constants
-    /// documented and used by `HidingBackend` in the pinned `p3-zk-proofs` crate.
-    ///
-    /// Call this from tests to catch drift when the pinned revision is updated.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any profile field disagrees with the backend constants.
-    pub fn assert_profile_matches_backend() {
-        use crate::ReferenceHidingFriPcsProfile;
-        let profile = ReferenceHidingFriPcsProfile::standard();
-        // Constants from p3-zk-proofs/src/backend.rs (private there, documented here):
-        //   LOG_BLOWUP_HIDING = 2
-        //   NUM_RANDOMIZER_COLS = 4
-        //   Challenge = BinomialExtensionField<BabyBear, 4>  →  extension_degree = 4
-        assert_eq!(
-            profile.log_blowup, 2,
-            "log_blowup drifted from backend LOG_BLOWUP_HIDING"
-        );
-        assert_eq!(
-            profile.num_random_codewords, 4,
-            "num_random_codewords drifted from backend NUM_RANDOMIZER_COLS"
-        );
-        assert_eq!(
-            profile.basis.extension_degree, 4,
-            "basis extension degree drifted from backend BinomialExtensionField<BabyBear, 4>"
-        );
     }
 }

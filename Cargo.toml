@@ -6,6 +6,7 @@ members = [
     "crates/shroud-codeword-embedding",
     "crates/shroud-opening-projection",
     "crates/shroud-oracle-commitment",
+    "crates/shroud-plonky3",
     "crates/shroud-quotient-hider",
     "crates/shroud-reference",
 ]

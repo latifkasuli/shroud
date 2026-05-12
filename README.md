@@ -16,6 +16,7 @@ This workspace is a small reference/spec implementation for the SHROUD protocol 
 - `shroud-quotient-hider`: the fourth SHROUD object, modeling decomposition-aware quotient hiding. Primary types: `ShroudQuotientHiderSpec`, `QuotientHiderPayload`.
 - `shroud-codeword-embedding`: the fifth SHROUD object, modeling the public trace plus hidden randomizer columns committed through a hiding FRI-style codeword embedding. Primary types: `ShroudCodewordEmbeddingSpec`, `CodewordEmbeddingShape`, `CodewordEmbeddingPayload`.
 - `shroud-reference`: a toy transcript/model layer used to exercise the protocol boundary. Primary types: `ReferenceTranscript`, `ReferencePlonky3Adapter`, `ReferenceLayeredAdapter`.
+- `shroud-plonky3`: backend-specific bridge to the pinned `p3-zk-proofs` integration vehicle. Owns the verifier-trust enforcement primitive (`verify_profile_matches_backend`), the `p3-symmetric` advisory floor (GHSA-3g92-f9ch-qjcm) — derived from `Cargo.lock` at build time so callers cannot lie about the resolved version — and the canonical Plonky3 hash-suite identifier. Primary types: `Plonky3HashIdentifier`, `PINNED_P3_SYMMETRIC_VERSION`, `BackendDriftError`. **Currently `assert_profile_matches_backend` panics with `UnpatchedSymmetric` because the pinned stack resolves `p3-symmetric = 0.5.2`; the bridge is not production-safe until `p3-zk-proofs` is upgraded.**
 
 ## Research Packet
 
@@ -55,7 +56,7 @@ Completed foundations:
 1. `BasisDescriptor` makes encoded-oracle bundle field reconstruction self-describing.
 2. Transcript order, degree-budget, payload-accounting, and malformed-plan cases have focused tests across the workspace.
 3. Fiat-Shamir binding now has a backend-neutral manifest layer, canonical `TranscriptBindable` surfaces, hash-suite binding, public-opening bindings, and reference challenge replay.
-4. `shroud-reference` contains the thin Plonky3-facing profile/prototype surface for `HidingFriPcs` alignment checks.
+4. `shroud-plonky3` contains the Plonky3-facing bridge: pinned-backend profile alignment (`verify_profile_matches_backend`), the `p3-symmetric` advisory floor enforced as a type-level precondition, and the canonical hash-suite identifier. `shroud-reference` stays backend-neutral.
 
 Next bridge work:
 

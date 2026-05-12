@@ -886,6 +886,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shroud-plonky3"
+version = "0.1.0"
+dependencies = [
+ "p3-zk-proofs",
+ "shroud-core",
+ "shroud-reference",
+]
+
+[[package]]
 name = "shroud-quotient-hider"
 version = "0.1.0"
 dependencies = [
@@ -896,7 +905,6 @@ dependencies = [
 name = "shroud-reference"
 version = "0.1.0"
 dependencies = [
- "p3-zk-proofs",
  "shroud-adapter",
  "shroud-batch-opening",
  "shroud-codeword-embedding",

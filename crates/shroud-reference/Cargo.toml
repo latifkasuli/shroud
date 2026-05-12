@@ -5,9 +5,6 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[features]
-plonky3-prototype = ["dep:p3-zk-proofs"]
-
 [dependencies]
 shroud-adapter = { path = "../shroud-adapter" }
 shroud-batch-opening = { path = "../shroud-batch-opening" }
@@ -16,11 +13,6 @@ shroud-core = { path = "../shroud-core" }
 shroud-opening-projection = { path = "../shroud-opening-projection" }
 shroud-oracle-commitment = { path = "../shroud-oracle-commitment" }
 shroud-quotient-hider = { path = "../shroud-quotient-hider" }
-
-[dependencies.p3-zk-proofs]
-git = "https://github.com/latifkasuli/p3-zk-proofs.git"
-rev = "d0c9fbc54e2314a90edd6a6ef84055c1179a4754"
-optional = true
 
 [lib]
 path = "src/lib.rs"

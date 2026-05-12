@@ -404,6 +404,39 @@ pub struct TranscriptBindingManifest {
 
 impl TranscriptBindingManifest {
     /// Creates an empty manifest — no exact-byte requirements on any sampling stage.
+    ///
+    /// # ⚠️ Dangerous: hand-rolled, half-empty manifest
+    ///
+    /// `new()` plus the `with_before_*` builders make every binding optional. A
+    /// caller can absorb one binding and pass the manifest to a transcript that
+    /// will happily sample challenges without ever absorbing the hash suite,
+    /// the hiding profile, the basis, or any SHROUD spec object. This is the
+    /// exact incomplete-binding failure mode that breaks Fiat-Shamir security:
+    ///
+    /// ```rust
+    /// use shroud_core::{TranscriptBindingManifest, SecurityLevel, TranscriptBindable};
+    ///
+    /// // Compiles and runs. Sampling against this manifest is unsound:
+    /// // only the security level is bound; every other parameter the
+    /// // challenge depends on is an attacker-controlled free variable.
+    /// let dangerous = TranscriptBindingManifest::new()
+    ///     .with_before_batching_challenge(
+    ///         SecurityLevel::Statistical.to_transcript_binding(),
+    ///     );
+    /// # let _ = dangerous;
+    /// ```
+    ///
+    /// # ✅ Safe: canonical constructor
+    ///
+    /// Production bridge code should use [`Self::standard_for_batch_opening`]
+    /// with a [`StandardBatchOpeningBindings`] built via
+    /// [`StandardBatchOpeningBindings::from_bindables`]. That path takes ten
+    /// typed `TranscriptBindable` parameters — the compiler refuses to build
+    /// a partial binding set.
+    ///
+    /// `new()` is retained for narrow schedule tests and protocol experiments
+    /// where a bespoke manifest is intentional. Using it in code that produces
+    /// or verifies real proofs is a review red flag — see `docs/security-model.md`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
