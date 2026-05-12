@@ -102,7 +102,34 @@ The `shroud-plonky3` crate pins constants the verifier re-derives independently 
 - `verify_profile_matches_backend(profile)` takes no version argument. The advisory check fires first — before any profile drift check — because without a patched hash, every other check is built on quicksand.
 - An earlier API exposed a `p3_symmetric: P3SymmetricVersion` parameter, which let callers declare a patched version against an unpatched graph. That trust hole is closed by removing the parameter.
 
-**Current state (intentionally surfaced):** the pinned `p3-zk-proofs` revision resolves `p3-symmetric = 0.5.2`. `verify_profile_matches_backend` therefore returns `BackendDriftError::UnpatchedSymmetric { declared: 0.5.2, min_patched: 0.6.0 }` for every profile, and `assert_profile_matches_backend()` panics with the advisory message. This is honest — the bridge is not production-safe until the pinned dep is upgraded. The test `pinned_state_is_currently_unpatched_per_advisory` asserts the current state and fails when the upgrade lands, triggering a sweep of related `#[should_panic]` tests.
+**Current state (intentionally surfaced):** the workspace resolves `p3-symmetric = 0.5.2` from `crates.io` (registry). `verify_profile_matches_backend` therefore returns `BackendDriftError::UnpatchedSymmetric` with a `Registry` provenance for every profile, and `assert_profile_matches_backend()` panics with the advisory message. This is honest — the bridge is not production-safe until the pinned dep is upgraded. The test `pinned_state_is_currently_unpatched_per_advisory` asserts the current state and fails when the upgrade lands, triggering a sweep of related `#[should_panic]` tests.
+
+#### Provenance gate — two acceptable paths to "patched"
+
+The advisory gate inspects `p3-symmetric`'s OWN `[[package]]` entry in `Cargo.lock` via `PINNED_P3_SYMMETRIC_PROVENANCE`, surfaced as a typed enum:
+
+```rust
+pub enum P3SymmetricProvenance {
+    Registry { version, checksum },
+    Git { version, source_url, rev },
+}
+```
+
+`check_advisory()` passes iff **either**:
+
+1. The source is `Registry` and `version >= 0.6.0`, OR
+2. The source is `Git` AND the resolved `(source_url, rev)` pair matches an entry in `shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`.
+
+**Source-conflation defense.** Pointing `p3-zk-proofs` at a Plonky3 commit with the `Pad10Sponge` patch does NOT change `p3-symmetric`'s own resolved source — Cargo still pulls `p3-symmetric` from `crates.io` unless an explicit `[patch.crates-io]` redirect targets `p3-symmetric` itself. The provenance gate therefore inspects `p3-symmetric`'s own entry, never `p3-zk-proofs`'s revision. This closes the trap of "the bridge crate is on a patched commit therefore the underlying hash must be patched."
+
+**Allowlist hygiene.** `KNOWN_PATCHED_P3_SYMMETRIC_SOURCES` is intentionally empty in production. Each future entry requires:
+
+- the upstream commit URL in the PR description,
+- a one-paragraph review of the `p3-symmetric` diff confirming it closes the advisory,
+- a co-sign from someone other than the bumper,
+- a `[patch.crates-io]` redirect in workspace `Cargo.toml` actually pointing `p3-symmetric` at the reviewed commit.
+
+The `known_patched_sources_allowlist_starts_empty` test fails when entries are added — CI failure is the trigger to re-review what was added and why. The `verify_provenance_*` tests exercise the gate logic with synthetic provenance + allowlist values: Registry-version-bump path, Git-allowlist-match path, matching-URL-wrong-rev rejection, matching-rev-wrong-URL rejection, and rejection of unallowlisted Git sources even when they self-declare `version >= 0.6.0`.
 
 ---
 

@@ -158,22 +158,128 @@ const fn parse_const_u64(s: &str) -> u64 {
     acc
 }
 
+/// Where the resolved `p3-symmetric` came from. Built from `Cargo.lock` at
+/// build time; callers cannot override it.
+///
+/// The provenance gate ([`check_advisory`]) inspects this OWN provenance of
+/// `p3-symmetric`, never `p3-zk-proofs`'s or any other crate's. The Cargo
+/// dependency graph can have `p3-zk-proofs` pinned to a patched Plonky3
+/// commit yet still resolve `p3-symmetric` from `crates.io` — only a
+/// `[patch.crates-io]` redirect changes `p3-symmetric`'s own source. This
+/// type makes that distinction structural rather than narrative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum P3SymmetricProvenance {
+    /// Resolved from a Cargo registry (typically `crates.io`).
+    Registry {
+        /// Declared semver from the lockfile entry.
+        version: P3SymmetricVersion,
+        /// SHA-256 of the `.crate` artifact, as recorded by Cargo. Empty
+        /// string if the lockfile entry lacks a `checksum` line.
+        checksum: &'static str,
+    },
+    /// Resolved from a Git source (e.g. via `[patch.crates-io]` override).
+    Git {
+        /// Declared semver from the lockfile entry. Note: this can be
+        /// anything the upstream `Cargo.toml` sets, including pre-`0.6`
+        /// numbers on a patched commit. **Do not infer patch state from
+        /// version alone for Git sources** — match `(source_url, rev)`
+        /// against [`KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`].
+        version: P3SymmetricVersion,
+        /// Clean repository URL (everything before `?` or `#`).
+        source_url: &'static str,
+        /// Full resolved commit hash (Cargo pins git deps to a specific commit).
+        rev: &'static str,
+    },
+}
+
+impl P3SymmetricProvenance {
+    /// Declared semver, regardless of source kind.
+    #[must_use]
+    pub const fn version(&self) -> P3SymmetricVersion {
+        match self {
+            Self::Registry { version, .. } | Self::Git { version, .. } => *version,
+        }
+    }
+}
+
+impl fmt::Display for P3SymmetricProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry { version, checksum } => {
+                write!(f, "registry: version {version}, checksum {checksum:?}")
+            }
+            Self::Git {
+                version,
+                source_url,
+                rev,
+            } => write!(f, "git: version {version}, source {source_url}, rev {rev}"),
+        }
+    }
+}
+
+/// Build-time-derived provenance for the resolved `p3-symmetric` crate.
+///
+/// This is the only authoritative provenance source used by [`check_advisory`]
+/// and [`verify_profile_matches_backend`]. The `build.rs` script parses
+/// `Cargo.lock` directly; lockfile changes trigger a build-script re-run
+/// so the const updates automatically.
+pub const PINNED_P3_SYMMETRIC_PROVENANCE: P3SymmetricProvenance = {
+    let version = P3SymmetricVersion::new(
+        parse_const_u64(env!("SHROUD_P3_SYM_MAJOR")),
+        parse_const_u64(env!("SHROUD_P3_SYM_MINOR")),
+        parse_const_u64(env!("SHROUD_P3_SYM_PATCH")),
+    );
+    let kind = parse_const_u64(env!("SHROUD_P3_SYM_SOURCE_KIND_CODE"));
+    if kind == 0 {
+        P3SymmetricProvenance::Registry {
+            version,
+            checksum: env!("SHROUD_P3_SYM_CHECKSUM"),
+        }
+    } else if kind == 1 {
+        P3SymmetricProvenance::Git {
+            version,
+            source_url: env!("SHROUD_P3_SYM_GIT_URL"),
+            rev: env!("SHROUD_P3_SYM_GIT_REV"),
+        }
+    } else {
+        panic!("invalid SHROUD_P3_SYM_SOURCE_KIND_CODE; expected 0 or 1");
+    }
+};
+
 /// The actually-resolved `p3-symmetric` version, derived from `Cargo.lock` at
-/// build time by `build.rs`.
+/// build time.
 ///
-/// This is the only authoritative version source used by [`check_advisory`]
-/// and [`verify_profile_matches_backend`]. Callers cannot override it; any
-/// "patched" claim made by a caller is rejected at the API boundary by not
-/// exposing a version parameter at all.
+/// This is a convenience accessor over [`PINNED_P3_SYMMETRIC_PROVENANCE`] for
+/// callers that only need the semver and don't care about the source kind.
+/// Most advisory-gate logic should consume the full provenance instead, since
+/// version alone does not establish patch state for git sources.
+pub const PINNED_P3_SYMMETRIC_VERSION: P3SymmetricVersion =
+    PINNED_P3_SYMMETRIC_PROVENANCE.version();
+
+/// Allowlist of (repository URL, commit hash) pairs for `p3-symmetric` git
+/// sources that have been reviewed and confirmed to contain the
+/// [GHSA-3g92-f9ch-qjcm] patch (the `Pad10Sponge` fix or an equivalent that
+/// closes sponge-length collision).
 ///
-/// If the underlying `p3-zk-proofs` revision is updated and the dependency
-/// graph resolves a different `p3-symmetric` version, the lockfile change
-/// triggers a `build.rs` re-run and this constant updates automatically.
-pub const PINNED_P3_SYMMETRIC_VERSION: P3SymmetricVersion = P3SymmetricVersion::new(
-    parse_const_u64(env!("SHROUD_P3_SYM_MAJOR")),
-    parse_const_u64(env!("SHROUD_P3_SYM_MINOR")),
-    parse_const_u64(env!("SHROUD_P3_SYM_PATCH")),
-);
+/// # ⚠️ Adding an entry is security-critical
+///
+/// Each entry MUST be justified by:
+///
+/// 1. The upstream commit URL in the PR description, with a one-paragraph
+///    review of the diff that closes the advisory.
+/// 2. Confirmation that the diff modifies `p3-symmetric` itself (NOT a
+///    transitively-related crate like `p3-zk-proofs`).
+/// 3. A co-sign from someone other than the bumper.
+///
+/// See `docs/security-model.md` § 4 for the full audit obligation.
+///
+/// This list is intentionally empty until the workspace actually patches the
+/// dependency graph via `[patch.crates-io]`. The clean path is an upstream
+/// `p3-symmetric >= 0.6.0` registry release; the allowlist is the escape
+/// hatch for cases where that release has not landed.
+///
+/// [GHSA-3g92-f9ch-qjcm]: https://github.com/Plonky3/Plonky3/security/advisories/GHSA-3g92-f9ch-qjcm
+pub const KNOWN_PATCHED_P3_SYMMETRIC_SOURCES: &[(&str, &str)] = &[];
 
 // ── BackendDriftError + verification ─────────────────────────────────────────
 
@@ -210,16 +316,25 @@ pub enum BackendDriftError {
         /// Value declared by the profile.
         actual: usize,
     },
-    /// The resolved `p3-symmetric` is below [`P3SymmetricVersion::MIN_PATCHED`].
+    /// The resolved `p3-symmetric` does not satisfy the advisory floor.
     ///
-    /// `declared` is read from [`PINNED_P3_SYMMETRIC_VERSION`] (build-time
-    /// derived from `Cargo.lock`), not from the caller. The bridge refuses to
-    /// start under this condition because GHSA-3g92-f9ch-qjcm allows an
-    /// attacker who can vary the number of hashed elements to construct
-    /// sponge collisions.
+    /// Provenance is derived from `Cargo.lock` by `build.rs` — not from the
+    /// caller. Failure modes:
+    ///
+    /// - **Registry, version < 0.6.0** — no patched registry release is
+    ///   available; bridge cannot start. Wait for an upstream `>= 0.6.0`
+    ///   release, or add a `[patch.crates-io]` redirect to a reviewed git
+    ///   source.
+    /// - **Git, version < 0.6.0, `(source_url, rev)` not in allowlist** —
+    ///   the workspace overrides `p3-symmetric` to a git source, but the
+    ///   specific commit has not been audit-reviewed and added to
+    ///   [`KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`].
+    ///
+    /// A caller-supplied "is patched" claim cannot satisfy the gate —
+    /// provenance is structural, not declarative.
     UnpatchedSymmetric {
-        /// Resolved `p3-symmetric` version (from `Cargo.lock`).
-        declared: P3SymmetricVersion,
+        /// Resolved provenance that failed the gate.
+        provenance: P3SymmetricProvenance,
         /// Minimum patched version per the advisory.
         min_patched: P3SymmetricVersion,
     },
@@ -265,14 +380,16 @@ impl fmt::Display for BackendDriftError {
                 "basis extension degree drifted from backend BinomialExtensionField<BabyBear, 4>: expected {expected}, got {actual}"
             ),
             Self::UnpatchedSymmetric {
-                declared,
+                provenance,
                 min_patched,
             } => write!(
                 f,
-                "p3-symmetric {declared} (resolved from Cargo.lock) is below the patched floor {min_patched}: \
-                 GHSA-3g92-f9ch-qjcm allows sponge-length collision when input \
-                 element counts can vary; the bridge refuses to start until the \
-                 pinned p3-zk-proofs revision resolves p3-symmetric >= {min_patched}"
+                "p3-symmetric failed the GHSA-3g92-f9ch-qjcm advisory gate: \
+                 resolved {provenance}; advisory floor is version >= {min_patched} OR a \
+                 git source matching shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES. \
+                 The bridge refuses to start until either the registry resolves a patched \
+                 release or the workspace adds a [patch.crates-io] redirect pointing \
+                 p3-symmetric at a reviewed git commit"
             ),
             Self::NonHidingInputMmcs => write!(
                 f,
@@ -308,19 +425,54 @@ pub fn required_plonky3_hiding_techniques() -> [HidingTechniqueClaim; 3] {
     ]
 }
 
-/// Checks the resolved `p3-symmetric` version against the advisory floor.
+/// Checks the resolved `p3-symmetric` provenance against the advisory.
 ///
-/// Returns [`BackendDriftError::UnpatchedSymmetric`] if
-/// [`PINNED_P3_SYMMETRIC_VERSION`] is below [`P3SymmetricVersion::MIN_PATCHED`].
-/// This is the single source of truth for the GHSA-3g92-f9ch-qjcm gate.
+/// Passes iff:
+///
+/// 1. The source is `Registry` and the declared version is `>= 0.6.0`, OR
+/// 2. The source is `Git` AND `(source_url, rev)` matches an entry in
+///    [`KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`].
+///
+/// The Git allowlist path requires that `p3-symmetric` *itself* be
+/// redirected to a reviewed git source (typically via `[patch.crates-io]`).
+/// A patched `p3-zk-proofs` revision does NOT satisfy the gate unless the
+/// dependency graph also redirects `p3-symmetric` — see the
+/// [`P3SymmetricProvenance`] doc comment for why version-alone cannot be
+/// trusted on git sources.
 pub fn check_advisory() -> Result<(), BackendDriftError> {
-    if !PINNED_P3_SYMMETRIC_VERSION.is_patched() {
-        return Err(BackendDriftError::UnpatchedSymmetric {
-            declared: PINNED_P3_SYMMETRIC_VERSION,
-            min_patched: P3SymmetricVersion::MIN_PATCHED,
-        });
+    verify_provenance(
+        PINNED_P3_SYMMETRIC_PROVENANCE,
+        KNOWN_PATCHED_P3_SYMMETRIC_SOURCES,
+    )
+}
+
+/// Pure-function variant of [`check_advisory`] used by both the production
+/// gate and the test suite. Returns `Ok` iff the given provenance meets the
+/// advisory floor under the given allowlist.
+///
+/// Exposed (rather than private) so test code can exercise the Git
+/// allowlist match path with synthetic provenance — the production
+/// allowlist is intentionally empty until a real patched source is
+/// reviewed.
+pub fn verify_provenance(
+    provenance: P3SymmetricProvenance,
+    allowlist: &[(&str, &str)],
+) -> Result<(), BackendDriftError> {
+    match provenance {
+        P3SymmetricProvenance::Registry { version, .. } if version.is_patched() => {
+            return Ok(());
+        }
+        P3SymmetricProvenance::Git {
+            source_url, rev, ..
+        } if allowlist.iter().any(|(u, r)| *u == source_url && *r == rev) => {
+            return Ok(());
+        }
+        _ => {}
     }
-    Ok(())
+    Err(BackendDriftError::UnpatchedSymmetric {
+        provenance,
+        min_patched: P3SymmetricVersion::MIN_PATCHED,
+    })
 }
 
 /// Checks every profile field that influences the bridge's hiding semantics
@@ -554,14 +706,185 @@ mod tests {
         let err = check_advisory().expect_err("unpatched stack must fail advisory check");
         match err {
             BackendDriftError::UnpatchedSymmetric {
-                declared,
+                provenance,
                 min_patched,
             } => {
-                assert_eq!(declared, PINNED_P3_SYMMETRIC_VERSION);
+                assert_eq!(provenance, PINNED_P3_SYMMETRIC_PROVENANCE);
                 assert_eq!(min_patched, P3SymmetricVersion::MIN_PATCHED);
             }
             other => panic!("expected UnpatchedSymmetric, got {other:?}"),
         }
+    }
+
+    // ── Provenance gate — Registry vs Git, allowlist match ──────────────────
+
+    #[test]
+    fn verify_provenance_accepts_patched_registry_version() {
+        // Registry source with version >= MIN_PATCHED is the clean path.
+        let prov = P3SymmetricProvenance::Registry {
+            version: P3SymmetricVersion::new(0, 6, 0),
+            checksum: "synthetic-checksum",
+        };
+        assert!(verify_provenance(prov, &[]).is_ok());
+    }
+
+    #[test]
+    fn verify_provenance_rejects_unpatched_registry_version() {
+        let prov = P3SymmetricProvenance::Registry {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            checksum: "synthetic-checksum",
+        };
+        let err = verify_provenance(prov, &[]).expect_err("registry < 0.6 must fail");
+        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+    }
+
+    #[test]
+    fn verify_provenance_rejects_unpatched_git_when_allowlist_empty() {
+        // Even with a git source, version < 0.6 fails when the commit is
+        // NOT in the reviewed allowlist. This is the conflation defense:
+        // a patched p3-zk-proofs commit cannot bless an unreviewed
+        // p3-symmetric git source.
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://github.com/example/p3-symmetric.git",
+            rev: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        };
+        let err = verify_provenance(prov, &[]).expect_err("unreviewed git source must fail");
+        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+    }
+
+    #[test]
+    fn verify_provenance_accepts_unpatched_git_when_in_allowlist() {
+        // version < 0.6 BUT the (url, rev) pair is in the reviewed allowlist.
+        // This is the escape hatch for [patch.crates-io] redirects pointing
+        // at a reviewed git commit that contains the GHSA-3g92-f9ch-qjcm fix.
+        let url = "https://github.com/example/p3-symmetric.git";
+        let rev = "abcd1234abcd1234abcd1234abcd1234abcd1234";
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 99),
+            source_url: url,
+            rev,
+        };
+        assert!(verify_provenance(prov, &[(url, rev)]).is_ok());
+    }
+
+    #[test]
+    fn verify_provenance_rejects_git_with_matching_url_but_wrong_rev() {
+        // The allowlist match is on the FULL (url, rev) pair — matching URL
+        // alone is insufficient. Different commits on the same repo can have
+        // wildly different patch state.
+        let url = "https://github.com/example/p3-symmetric.git";
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: url,
+            rev: "1111111111111111111111111111111111111111",
+        };
+        let allowlist = [(url, "2222222222222222222222222222222222222222")];
+        let err =
+            verify_provenance(prov, &allowlist).expect_err("matching url but wrong rev must fail");
+        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+    }
+
+    #[test]
+    fn verify_provenance_rejects_git_with_matching_rev_but_wrong_url() {
+        // Symmetric: matching rev on the wrong repo URL is insufficient.
+        // A commit hash collision across repos is astronomically unlikely
+        // but the gate cannot rely on that — the pair must match together.
+        let rev = "abcd1234abcd1234abcd1234abcd1234abcd1234";
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://github.com/attacker/lookalike.git",
+            rev,
+        };
+        let allowlist = [("https://github.com/example/p3-symmetric.git", rev)];
+        let err =
+            verify_provenance(prov, &allowlist).expect_err("matching rev but wrong url must fail");
+        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+    }
+
+    #[test]
+    fn verify_provenance_rejects_patched_git_when_not_allowlisted() {
+        // Git source semver is self-declared by the fork. Even version >= 0.6
+        // cannot bypass the reviewed (url, rev) allowlist requirement.
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 7, 0),
+            source_url: "https://github.com/example/p3-symmetric.git",
+            rev: "unreviewed-even-though-version-is-patched",
+        };
+        let err = verify_provenance(prov, &[]).expect_err("unreviewed git source must fail");
+        assert!(matches!(err, BackendDriftError::UnpatchedSymmetric { .. }));
+    }
+
+    #[test]
+    fn verify_provenance_accepts_patched_git_when_allowlisted() {
+        let url = "https://github.com/example/p3-symmetric.git";
+        let rev = "reviewed-patched-git-revision";
+        let prov = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 7, 0),
+            source_url: url,
+            rev,
+        };
+        assert!(verify_provenance(prov, &[(url, rev)]).is_ok());
+    }
+
+    #[test]
+    fn known_patched_sources_allowlist_starts_empty() {
+        // Audit hygiene: the production allowlist must be empty until a real
+        // patched source is reviewed. CI failure here is the trigger to
+        // re-review what was added and why.
+        assert!(
+            KNOWN_PATCHED_P3_SYMMETRIC_SOURCES.is_empty(),
+            "allowlist contains {} entries; each must be audit-justified per docs/security-model.md §4",
+            KNOWN_PATCHED_P3_SYMMETRIC_SOURCES.len()
+        );
+    }
+
+    // ── Provenance accessors and Display ────────────────────────────────────
+
+    #[test]
+    fn provenance_version_accessor_returns_inner_version() {
+        let reg = P3SymmetricProvenance::Registry {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            checksum: "x",
+        };
+        assert_eq!(reg.version(), P3SymmetricVersion::new(0, 5, 2));
+        let git = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 7, 0),
+            source_url: "u",
+            rev: "r",
+        };
+        assert_eq!(git.version(), P3SymmetricVersion::new(0, 7, 0));
+    }
+
+    #[test]
+    fn provenance_display_distinguishes_registry_and_git() {
+        let reg = P3SymmetricProvenance::Registry {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            checksum: "synthetic-checksum",
+        };
+        let git = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://example.com/repo.git",
+            rev: "deadbeef",
+        };
+        let reg_msg = reg.to_string();
+        let git_msg = git.to_string();
+        assert!(reg_msg.contains("registry"));
+        assert!(reg_msg.contains("synthetic-checksum"));
+        assert!(git_msg.contains("git"));
+        assert!(git_msg.contains("https://example.com/repo.git"));
+        assert!(git_msg.contains("deadbeef"));
+    }
+
+    #[test]
+    fn pinned_provenance_version_matches_pinned_version_accessor() {
+        // The convenience PINNED_P3_SYMMETRIC_VERSION must always equal
+        // PINNED_P3_SYMMETRIC_PROVENANCE.version() — they're two views of
+        // the same lockfile entry.
+        assert_eq!(
+            PINNED_P3_SYMMETRIC_VERSION,
+            PINNED_P3_SYMMETRIC_PROVENANCE.version()
+        );
     }
 
     #[test]
@@ -716,16 +1039,37 @@ mod tests {
     }
 
     #[test]
-    fn unpatched_display_cites_advisory_and_resolved_version() {
+    fn unpatched_display_cites_advisory_and_provenance() {
         let err = BackendDriftError::UnpatchedSymmetric {
-            declared: P3SymmetricVersion::new(0, 5, 9),
+            provenance: P3SymmetricProvenance::Registry {
+                version: P3SymmetricVersion::new(0, 5, 9),
+                checksum: "synthetic-checksum",
+            },
             min_patched: P3SymmetricVersion::MIN_PATCHED,
         };
         let msg = err.to_string();
         assert!(msg.contains("GHSA-3g92-f9ch-qjcm"));
         assert!(msg.contains("0.5.9"));
         assert!(msg.contains("0.6.0"));
-        assert!(msg.contains("Cargo.lock"));
+        assert!(msg.contains("registry"));
+        assert!(msg.contains("synthetic-checksum"));
+    }
+
+    #[test]
+    fn unpatched_display_for_git_source_includes_url_and_rev() {
+        let err = BackendDriftError::UnpatchedSymmetric {
+            provenance: P3SymmetricProvenance::Git {
+                version: P3SymmetricVersion::new(0, 5, 2),
+                source_url: "https://github.com/example/p3-symmetric.git",
+                rev: "abcd1234",
+            },
+            min_patched: P3SymmetricVersion::MIN_PATCHED,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("git"));
+        assert!(msg.contains("https://github.com/example/p3-symmetric.git"));
+        assert!(msg.contains("abcd1234"));
+        assert!(msg.contains("KNOWN_PATCHED_P3_SYMMETRIC_SOURCES"));
     }
 
     #[test]
