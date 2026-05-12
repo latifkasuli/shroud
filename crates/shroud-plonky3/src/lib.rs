@@ -10,8 +10,8 @@
 //!   [`BACKEND_NUM_RANDOMIZER_COLS`], [`BACKEND_EXTENSION_DEGREE`],
 //!   [`BACKEND_NUM_QUERIES`], [`BACKEND_QUERY_POW_BITS`];
 //! - the **build-time-derived** `p3-symmetric` version
-//!   ([`PINNED_P3_SYMMETRIC_VERSION`]) and the advisory floor
-//!   ([`P3SymmetricVersion::MIN_PATCHED`]) from [GHSA-3g92-f9ch-qjcm];
+//!   ([`PINNED_P3_SYMMETRIC_VERSION`]) and the last-affected floor
+//!   ([`P3SymmetricVersion::LAST_AFFECTED`]) from [GHSA-3g92-f9ch-qjcm];
 //! - the canonical hash-suite identifier ([`Plonky3HashIdentifier::standard`]),
 //!   which embeds the resolved `p3-symmetric` version so transcripts cannot
 //!   replay under a different stack.
@@ -30,12 +30,13 @@
 //! which parses the workspace `Cargo.lock`. Public APIs read from the const;
 //! there is no caller-supplied path.
 //!
-//! While the resolved `p3-symmetric` remains `< 0.6`,
-//! [`verify_profile_matches_backend`] returns
+//! While the resolved `p3-symmetric` remains `≤ 0.5.2` from a registry
+//! source, [`verify_profile_matches_backend`] returns
 //! [`BackendDriftError::UnpatchedSymmetric`] for every profile. That is the
-//! honest state: the bridge is not safe to use in production until the
-//! pinned `p3-zk-proofs` revision is updated to a stack that resolves
-//! `p3-symmetric >= 0.6`.
+//! honest state: the bridge is not safe to use in production until either
+//! the registry resolves a patched release (`> 0.5.2`) or the workspace
+//! redirects `p3-symmetric` to a reviewed git source via
+//! `[patch.crates-io]`.
 //!
 //! [GHSA-3g92-f9ch-qjcm]: https://github.com/Plonky3/Plonky3/security/advisories/GHSA-3g92-f9ch-qjcm
 
@@ -100,10 +101,17 @@ pub struct P3SymmetricVersion {
 }
 
 impl P3SymmetricVersion {
-    /// Minimum patched version per [GHSA-3g92-f9ch-qjcm] (published 2026-04-16).
+    /// Last affected version per [GHSA-3g92-f9ch-qjcm] (published 2026-04-16).
+    ///
+    /// The advisory lists `0.5.2` as the most recent affected release. Any
+    /// strictly-greater version is considered patched-by-semver; equal or
+    /// lesser versions fail the advisory gate. This is intentionally
+    /// `LAST_AFFECTED` (a fact about the past), not `MIN_PATCHED` (which
+    /// would commit to a specific future floor like `0.6.0` and reject a
+    /// hypothetical `0.5.3` patch release).
     ///
     /// [GHSA-3g92-f9ch-qjcm]: https://github.com/Plonky3/Plonky3/security/advisories/GHSA-3g92-f9ch-qjcm
-    pub const MIN_PATCHED: Self = Self::new(0, 6, 0);
+    pub const LAST_AFFECTED: Self = Self::new(0, 5, 2);
 
     /// Constructs a [`P3SymmetricVersion`] from major/minor/patch components.
     #[must_use]
@@ -115,22 +123,28 @@ impl P3SymmetricVersion {
         }
     }
 
-    /// Returns `true` if this version is at least [`Self::MIN_PATCHED`].
+    /// Returns `true` if this version is **strictly greater** than
+    /// [`Self::LAST_AFFECTED`] — i.e., not on the advisory's affected list.
     ///
     /// Lexicographic compare over `(major, minor, patch)`. Written manually
-    /// (rather than as `*self >= Self::MIN_PATCHED` over a derived `PartialOrd`)
-    /// so this stays `const fn` — the const is consumed by the const advisory
-    /// gate in [`check_advisory`].
+    /// (rather than as `*self > Self::LAST_AFFECTED` over a derived
+    /// `PartialOrd`) so this stays `const fn` — the const is consumed by
+    /// the const advisory gate in [`check_advisory`].
+    ///
+    /// **Semver-trust caveat.** For [`P3SymmetricProvenance::Git`] sources,
+    /// `is_patched()` returning `true` is NOT sufficient — git semver is a
+    /// string in the fork's `Cargo.toml`, not an authenticated claim. The
+    /// gate uses `(source_url, rev)` allowlist matching for git sources
+    /// regardless of declared version.
     #[must_use]
-    #[allow(clippy::absurd_extreme_comparisons)] // MIN_PATCHED components may be u64::MIN; the form is intentional
     pub const fn is_patched(&self) -> bool {
-        if self.major != Self::MIN_PATCHED.major {
-            return self.major > Self::MIN_PATCHED.major;
+        if self.major != Self::LAST_AFFECTED.major {
+            return self.major > Self::LAST_AFFECTED.major;
         }
-        if self.minor != Self::MIN_PATCHED.minor {
-            return self.minor > Self::MIN_PATCHED.minor;
+        if self.minor != Self::LAST_AFFECTED.minor {
+            return self.minor > Self::LAST_AFFECTED.minor;
         }
-        self.patch >= Self::MIN_PATCHED.patch
+        self.patch > Self::LAST_AFFECTED.patch
     }
 }
 
@@ -316,27 +330,31 @@ pub enum BackendDriftError {
         /// Value declared by the profile.
         actual: usize,
     },
-    /// The resolved `p3-symmetric` does not satisfy the advisory floor.
+    /// The resolved `p3-symmetric` does not satisfy the advisory gate.
     ///
     /// Provenance is derived from `Cargo.lock` by `build.rs` — not from the
     /// caller. Failure modes:
     ///
-    /// - **Registry, version < 0.6.0** — no patched registry release is
-    ///   available; bridge cannot start. Wait for an upstream `>= 0.6.0`
-    ///   release, or add a `[patch.crates-io]` redirect to a reviewed git
-    ///   source.
-    /// - **Git, version < 0.6.0, `(source_url, rev)` not in allowlist** —
-    ///   the workspace overrides `p3-symmetric` to a git source, but the
-    ///   specific commit has not been audit-reviewed and added to
-    ///   [`KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`].
+    /// - **Registry, version ≤ [`P3SymmetricVersion::LAST_AFFECTED`]** — no
+    ///   patched registry release is available. Wait for an upstream
+    ///   `> 0.5.2` release (e.g., `0.5.3`, `0.6.0`), or add a
+    ///   `[patch.crates-io]` redirect to a reviewed git source.
+    /// - **Git, `(source_url, rev)` not in allowlist** — the workspace
+    ///   overrides `p3-symmetric` to a git source, but the specific commit
+    ///   has not been audit-reviewed and added to
+    ///   [`KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`]. Note: a git source's
+    ///   declared semver is never sufficient — fork authors can publish
+    ///   any version string in their `Cargo.toml` (the lying-fork attack).
     ///
     /// A caller-supplied "is patched" claim cannot satisfy the gate —
     /// provenance is structural, not declarative.
     UnpatchedSymmetric {
         /// Resolved provenance that failed the gate.
         provenance: P3SymmetricProvenance,
-        /// Minimum patched version per the advisory.
-        min_patched: P3SymmetricVersion,
+        /// Last affected version per the advisory. Strict-greater versions
+        /// are accepted on `Registry` sources; `Git` sources never accept
+        /// by version alone (allowlist match required).
+        last_affected: P3SymmetricVersion,
     },
     /// The profile declares `input_mmcs_hiding = false`.
     ///
@@ -381,15 +399,18 @@ impl fmt::Display for BackendDriftError {
             ),
             Self::UnpatchedSymmetric {
                 provenance,
-                min_patched,
+                last_affected,
             } => write!(
                 f,
                 "p3-symmetric failed the GHSA-3g92-f9ch-qjcm advisory gate: \
-                 resolved {provenance}; advisory floor is version >= {min_patched} OR a \
-                 git source matching shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES. \
-                 The bridge refuses to start until either the registry resolves a patched \
-                 release or the workspace adds a [patch.crates-io] redirect pointing \
-                 p3-symmetric at a reviewed git commit"
+                 resolved {provenance}; last affected version is {last_affected}. \
+                 Accepted: (Registry, version > {last_affected}) OR (Git, (source_url, rev) \
+                 in shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES). \
+                 Note: Git semver is unauthenticated — patched-by-version claims on \
+                 a git source MUST go through allowlist review. The bridge refuses to \
+                 start until either the registry resolves a patched release or the \
+                 workspace adds a [patch.crates-io] redirect pointing p3-symmetric at \
+                 a reviewed git commit"
             ),
             Self::NonHidingInputMmcs => write!(
                 f,
@@ -471,7 +492,7 @@ pub fn verify_provenance(
     }
     Err(BackendDriftError::UnpatchedSymmetric {
         provenance,
-        min_patched: P3SymmetricVersion::MIN_PATCHED,
+        last_affected: P3SymmetricVersion::LAST_AFFECTED,
     })
 }
 
@@ -565,14 +586,26 @@ pub fn assert_profile_matches_backend() {
 /// suite via [`shroud_core::HashIdentifier`]. For Plonky3 bridges, a free-form
 /// string is too loose — auditors need to know *exactly* which combination of
 /// field, extension, hash, sponge, challenger, MMCS, DFT, RNG, and resolved
-/// `p3-symmetric` version produced the challenges.
+/// `p3-symmetric` **provenance** (source kind + version + checksum/rev)
+/// produced the challenges.
+///
+/// # Why provenance, not just version
+///
+/// Embedding only `p3-symmetric`'s declared semver leaves a suite-confusion
+/// hole: an unpatched `Registry { version: 0.5.2 }` and a patched
+/// `Git { version: 0.5.2, rev: <reviewed> }` would render the same
+/// identifier, so a verifier on the patched stack could be tricked into
+/// accepting a proof generated under the unpatched stack. Including the
+/// full [`P3SymmetricProvenance`] (kind, version, AND checksum or rev)
+/// makes the two suites byte-different, closing the hole.
 ///
 /// [`Self::standard`] produces the canonical identifier for the pinned
-/// `p3-zk-proofs` backend at commit `d0c9fbc54e2314a90edd6a6ef84055c1179a4754`.
-/// The embedded `p3-symmetric` version is [`PINNED_P3_SYMMETRIC_VERSION`] —
-/// the actual resolved value, not a caller-supplied one — so changing the
-/// underlying dep necessarily changes the rendered identifier and replay
-/// rejects across the boundary.
+/// `p3-zk-proofs` backend at commit `d0c9fbc54e2314a90edd6a6ef84055c1179a4754`,
+/// embedding [`PINNED_P3_SYMMETRIC_PROVENANCE`] — the actual resolved
+/// provenance, not a caller-supplied one. Changing the underlying dep
+/// (registry version bump, `[patch.crates-io]` redirect, allowlist update)
+/// necessarily changes the rendered identifier and replay rejects across
+/// the boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Plonky3HashIdentifier {
     field: &'static str,
@@ -588,7 +621,7 @@ pub struct Plonky3HashIdentifier {
     num_randomizer_cols: usize,
     num_queries: usize,
     query_pow_bits: usize,
-    p3_symmetric: P3SymmetricVersion,
+    p3_symmetric: P3SymmetricProvenance,
 }
 
 impl Plonky3HashIdentifier {
@@ -596,9 +629,10 @@ impl Plonky3HashIdentifier {
     ///
     /// Components correspond exactly to the type aliases in
     /// `p3_zk_proofs::backend` at the pinned commit. The embedded
-    /// `p3-symmetric` version is read from [`PINNED_P3_SYMMETRIC_VERSION`].
-    /// Updating the pinned revision changes the rendered identifier
-    /// automatically through the build-time derivation.
+    /// `p3-symmetric` provenance is read from [`PINNED_P3_SYMMETRIC_PROVENANCE`]
+    /// — Cargo.lock-derived, not caller-supplied. Updating the pinned revision
+    /// (or adding a `[patch.crates-io]` redirect) changes the rendered
+    /// identifier automatically through the build-time derivation.
     #[must_use]
     pub const fn standard() -> Self {
         Self {
@@ -615,15 +649,20 @@ impl Plonky3HashIdentifier {
             num_randomizer_cols: BACKEND_NUM_RANDOMIZER_COLS,
             num_queries: BACKEND_NUM_QUERIES,
             query_pow_bits: BACKEND_QUERY_POW_BITS,
-            p3_symmetric: PINNED_P3_SYMMETRIC_VERSION,
+            p3_symmetric: PINNED_P3_SYMMETRIC_PROVENANCE,
         }
     }
 
     /// Renders the canonical identifier as a stable, colon-separated string.
+    ///
+    /// The `p3-symmetric` suffix encodes the full provenance — source kind,
+    /// version, and (registry) checksum or (git) repo URL + commit hash —
+    /// so two stacks with the same declared version but different actual
+    /// sources produce byte-different identifiers.
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "plonky3-zk:v1:{}:ext{}:{}:{}:{}:{}:{}:{}:{}:log_blowup{}:randomizers{}:queries{}:pow{}:p3sym{}",
+            "plonky3-zk:v1:{}:ext{}:{}:{}:{}:{}:{}:{}:{}:log_blowup{}:randomizers{}:queries{}:pow{}:{}",
             self.field,
             self.extension_degree,
             self.byte_hash,
@@ -637,7 +676,7 @@ impl Plonky3HashIdentifier {
             self.num_randomizer_cols,
             self.num_queries,
             self.query_pow_bits,
-            self.p3_symmetric,
+            render_p3_symmetric_provenance(&self.p3_symmetric),
         )
     }
 
@@ -647,21 +686,46 @@ impl Plonky3HashIdentifier {
         HashIdentifier::new(self.render())
     }
 
-    /// Returns the embedded `p3-symmetric` version (= [`PINNED_P3_SYMMETRIC_VERSION`]
-    /// for the standard constructor).
+    /// Returns the embedded `p3-symmetric` provenance
+    /// (= [`PINNED_P3_SYMMETRIC_PROVENANCE`] for the standard constructor).
     #[must_use]
-    pub const fn p3_symmetric(&self) -> P3SymmetricVersion {
+    pub const fn p3_symmetric(&self) -> P3SymmetricProvenance {
         self.p3_symmetric
     }
 
     /// Test-only: constructs an identifier with an explicit `p3-symmetric`
-    /// version, used to verify that the rendered identifier responds to
-    /// changes in the embedded version. NOT for production code.
+    /// provenance, used to verify that the rendered identifier responds to
+    /// changes in source kind, checksum, or git revision — not just version.
+    /// NOT for production code.
     #[cfg(test)]
-    fn with_p3_symmetric_for_test(p3_symmetric: P3SymmetricVersion) -> Self {
+    fn with_p3_symmetric_for_test(p3_symmetric: P3SymmetricProvenance) -> Self {
         let mut id = Self::standard();
         id.p3_symmetric = p3_symmetric;
         id
+    }
+}
+
+/// Renders a [`P3SymmetricProvenance`] into the canonical hash-identifier
+/// suffix. Format keeps Registry and Git as byte-different prefixes so
+/// suite-confusion across source kinds is structurally impossible:
+///
+/// - Registry: `p3sym_reg:VERSION:CHECKSUM`
+/// - Git:      `p3sym_git:VERSION:SOURCE_URL:REV`
+///
+/// Both fields after the prefix are emitted verbatim. The identifier is
+/// hashed into the transcript, not parsed back, so URL characters like `:`
+/// inside `source_url` do not affect security — they just make the rendered
+/// string slightly noisier for humans.
+fn render_p3_symmetric_provenance(p: &P3SymmetricProvenance) -> String {
+    match p {
+        P3SymmetricProvenance::Registry { version, checksum } => {
+            format!("p3sym_reg:{version}:{checksum}")
+        }
+        P3SymmetricProvenance::Git {
+            version,
+            source_url,
+            rev,
+        } => format!("p3sym_git:{version}:{source_url}:{rev}"),
     }
 }
 
@@ -707,10 +771,10 @@ mod tests {
         match err {
             BackendDriftError::UnpatchedSymmetric {
                 provenance,
-                min_patched,
+                last_affected,
             } => {
                 assert_eq!(provenance, PINNED_P3_SYMMETRIC_PROVENANCE);
-                assert_eq!(min_patched, P3SymmetricVersion::MIN_PATCHED);
+                assert_eq!(last_affected, P3SymmetricVersion::LAST_AFFECTED);
             }
             other => panic!("expected UnpatchedSymmetric, got {other:?}"),
         }
@@ -720,9 +784,10 @@ mod tests {
 
     #[test]
     fn verify_provenance_accepts_patched_registry_version() {
-        // Registry source with version >= MIN_PATCHED is the clean path.
+        // Registry source with version > LAST_AFFECTED is the clean path.
+        // A future 0.5.3 patch release would qualify here.
         let prov = P3SymmetricProvenance::Registry {
-            version: P3SymmetricVersion::new(0, 6, 0),
+            version: P3SymmetricVersion::new(0, 5, 3),
             checksum: "synthetic-checksum",
         };
         assert!(verify_provenance(prov, &[]).is_ok());
@@ -1042,15 +1107,15 @@ mod tests {
     fn unpatched_display_cites_advisory_and_provenance() {
         let err = BackendDriftError::UnpatchedSymmetric {
             provenance: P3SymmetricProvenance::Registry {
-                version: P3SymmetricVersion::new(0, 5, 9),
+                version: P3SymmetricVersion::new(0, 5, 1),
                 checksum: "synthetic-checksum",
             },
-            min_patched: P3SymmetricVersion::MIN_PATCHED,
+            last_affected: P3SymmetricVersion::LAST_AFFECTED,
         };
         let msg = err.to_string();
         assert!(msg.contains("GHSA-3g92-f9ch-qjcm"));
-        assert!(msg.contains("0.5.9"));
-        assert!(msg.contains("0.6.0"));
+        assert!(msg.contains("0.5.1"));
+        assert!(msg.contains("0.5.2")); // last_affected
         assert!(msg.contains("registry"));
         assert!(msg.contains("synthetic-checksum"));
     }
@@ -1063,13 +1128,17 @@ mod tests {
                 source_url: "https://github.com/example/p3-symmetric.git",
                 rev: "abcd1234",
             },
-            min_patched: P3SymmetricVersion::MIN_PATCHED,
+            last_affected: P3SymmetricVersion::LAST_AFFECTED,
         };
         let msg = err.to_string();
         assert!(msg.contains("git"));
         assert!(msg.contains("https://github.com/example/p3-symmetric.git"));
         assert!(msg.contains("abcd1234"));
         assert!(msg.contains("KNOWN_PATCHED_P3_SYMMETRIC_SOURCES"));
+        assert!(
+            msg.contains("unauthenticated") || msg.contains("lying"),
+            "Display must warn that Git semver is unauthenticated"
+        );
     }
 
     #[test]
@@ -1092,30 +1161,49 @@ mod tests {
     // ── P3SymmetricVersion ───────────────────────────────────────────────────
 
     #[test]
-    fn min_patched_is_zero_six_zero() {
+    fn last_affected_is_zero_five_two() {
         assert_eq!(
-            P3SymmetricVersion::MIN_PATCHED,
-            P3SymmetricVersion::new(0, 6, 0)
+            P3SymmetricVersion::LAST_AFFECTED,
+            P3SymmetricVersion::new(0, 5, 2)
         );
     }
 
     #[test]
-    fn is_patched_accepts_exact_floor() {
-        assert!(P3SymmetricVersion::new(0, 6, 0).is_patched());
+    fn is_patched_rejects_exact_last_affected() {
+        // 0.5.2 is the last affected version — it is NOT patched.
+        // This is the key correction from the prior MIN_PATCHED model:
+        // we no longer require a specific future floor like 0.6.0.
+        assert!(!P3SymmetricVersion::LAST_AFFECTED.is_patched());
+        assert!(!P3SymmetricVersion::new(0, 5, 2).is_patched());
     }
 
     #[test]
-    fn is_patched_accepts_above_floor() {
+    fn is_patched_accepts_next_patch_release() {
+        // A hypothetical 0.5.3 patch release would qualify as patched,
+        // even before any 0.6.x lands. This is the upstream-friendliness
+        // property the prior MIN_PATCHED model overshot.
+        assert!(P3SymmetricVersion::new(0, 5, 3).is_patched());
+    }
+
+    #[test]
+    fn is_patched_accepts_strictly_above_last_affected() {
+        // Anything > 0.5.2 — including future 0.5.x patch releases AND
+        // future major/minor bumps — counts as patched.
+        assert!(P3SymmetricVersion::new(0, 5, 99).is_patched());
+        assert!(P3SymmetricVersion::new(0, 6, 0).is_patched());
         assert!(P3SymmetricVersion::new(0, 6, 1).is_patched());
         assert!(P3SymmetricVersion::new(0, 7, 0).is_patched());
         assert!(P3SymmetricVersion::new(1, 0, 0).is_patched());
     }
 
     #[test]
-    fn is_patched_rejects_below_floor() {
-        assert!(!P3SymmetricVersion::new(0, 5, 99).is_patched());
+    fn is_patched_rejects_at_or_below_last_affected() {
+        // Exact LAST_AFFECTED and everything strictly less than it.
+        assert!(!P3SymmetricVersion::new(0, 5, 2).is_patched());
+        assert!(!P3SymmetricVersion::new(0, 5, 1).is_patched());
         assert!(!P3SymmetricVersion::new(0, 5, 0).is_patched());
         assert!(!P3SymmetricVersion::new(0, 0, 1).is_patched());
+        assert!(!P3SymmetricVersion::new(0, 0, 0).is_patched());
     }
 
     #[test]
@@ -1144,10 +1232,13 @@ mod tests {
         assert!(rendered.contains(":randomizers4:"));
         assert!(rendered.contains(":queries40:"));
         assert!(rendered.contains(":pow8:"));
-        // Embedded p3-symmetric MUST be the pinned (build-time-derived) version,
-        // never a caller-controlled one.
-        let expected_suffix = format!(":p3sym{PINNED_P3_SYMMETRIC_VERSION}");
-        assert!(rendered.ends_with(&expected_suffix));
+        // Embedded p3-symmetric MUST be the pinned (build-time-derived)
+        // provenance, with a source-kind prefix distinguishing registry from
+        // git — not just a bare version.
+        assert!(
+            rendered.contains(":p3sym_reg:") || rendered.contains(":p3sym_git:"),
+            "rendered identifier must carry a source-kind prefix; got {rendered:?}"
+        );
     }
 
     #[test]
@@ -1163,19 +1254,111 @@ mod tests {
         // propagates into the rendered identifier.
         let a = Plonky3HashIdentifier::standard().render();
         let b =
-            Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricVersion::new(99, 99, 99))
-                .render();
+            Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Registry {
+                version: P3SymmetricVersion::new(99, 99, 99),
+                checksum: "synthetic",
+            })
+            .render();
         assert_ne!(a, b);
-        assert!(b.contains(":p3sym99.99.99"));
+        assert!(b.contains(":p3sym_reg:99.99.99:synthetic"));
+    }
+
+    /// **Critical security test for suite confusion (path 3 of the bridge
+    /// upgrade plan).** A patched git source and an unpatched registry
+    /// source at the same declared version MUST render byte-different
+    /// identifiers. Otherwise a verifier on the patched stack would accept
+    /// a proof generated under the unpatched stack — exactly the failure
+    /// mode the provenance embedding is designed to close.
+    #[test]
+    fn identifier_distinguishes_unpatched_registry_from_patched_git_at_same_version() {
+        let unpatched_registry = P3SymmetricProvenance::Registry {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            checksum: "unpatched-crates-io-checksum",
+        };
+        let patched_git = P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://github.com/example/p3-symmetric-patched.git",
+            rev: "abcdef1234567890abcdef1234567890abcdef12",
+        };
+        let a = Plonky3HashIdentifier::with_p3_symmetric_for_test(unpatched_registry).render();
+        let b = Plonky3HashIdentifier::with_p3_symmetric_for_test(patched_git).render();
+        assert_ne!(
+            a, b,
+            "patched-git and unpatched-registry must produce different transcript suite IDs"
+        );
+        assert!(a.contains(":p3sym_reg:"));
+        assert!(b.contains(":p3sym_git:"));
+    }
+
+    /// Two registry sources at the same version but different checksums
+    /// (e.g., a yanked-and-republished crate or a malicious registry mirror)
+    /// must render different identifiers.
+    #[test]
+    fn identifier_distinguishes_different_registry_checksums() {
+        let a =
+            Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Registry {
+                version: P3SymmetricVersion::new(0, 5, 2),
+                checksum: "checksum-a",
+            })
+            .render();
+        let b =
+            Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Registry {
+                version: P3SymmetricVersion::new(0, 5, 2),
+                checksum: "checksum-b",
+            })
+            .render();
+        assert_ne!(a, b);
+    }
+
+    /// Two git sources at the same URL and same declared version but
+    /// different commit hashes (e.g., a force-push attack or an honest
+    /// rebase) must render different identifiers.
+    #[test]
+    fn identifier_distinguishes_different_git_revs() {
+        let url = "https://github.com/example/p3-symmetric-patched.git";
+        let a = Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: url,
+            rev: "1111111111111111111111111111111111111111",
+        })
+        .render();
+        let b = Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: url,
+            rev: "2222222222222222222222222222222222222222",
+        })
+        .render();
+        assert_ne!(a, b);
+    }
+
+    /// Two git sources with the same commit hash but different URLs (a
+    /// lookalike-repo attack) must render different identifiers.
+    #[test]
+    fn identifier_distinguishes_different_git_urls() {
+        let rev = "abcdef1234567890abcdef1234567890abcdef12";
+        let a = Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://github.com/example/p3-symmetric-patched.git",
+            rev,
+        })
+        .render();
+        let b = Plonky3HashIdentifier::with_p3_symmetric_for_test(P3SymmetricProvenance::Git {
+            version: P3SymmetricVersion::new(0, 5, 2),
+            source_url: "https://github.com/attacker/lookalike.git",
+            rev,
+        })
+        .render();
+        assert_ne!(a, b);
     }
 
     #[test]
-    fn standard_identifier_embeds_resolved_version_not_min_patched() {
-        // The point of P1 fix: the identifier reflects what is, not what
-        // we wish were true. Even though MIN_PATCHED = 0.6.0, the standard
-        // identifier embeds the actually-resolved version (currently 0.5.2).
+    fn standard_identifier_embeds_resolved_provenance() {
+        // The point: the identifier reflects what is, not what we wish were
+        // true. Even though the resolved version is the last affected one,
+        // the standard identifier embeds it (along with source kind and
+        // checksum) honestly.
         let rendered = Plonky3HashIdentifier::standard().render();
-        let expected_suffix = format!(":p3sym{PINNED_P3_SYMMETRIC_VERSION}");
+        let expected_suffix = render_p3_symmetric_provenance(&PINNED_P3_SYMMETRIC_PROVENANCE);
         assert!(rendered.ends_with(&expected_suffix));
     }
 

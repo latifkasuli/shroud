@@ -84,7 +84,7 @@ The `shroud-plonky3` crate pins constants the verifier re-derives independently 
 | Challenge field extension degree | `shroud_plonky3::BACKEND_EXTENSION_DEGREE` → `verify_profile_matches_backend` |
 | FRI query count | `shroud_plonky3::BACKEND_NUM_QUERIES` |
 | Query proof-of-work bits | `shroud_plonky3::BACKEND_QUERY_POW_BITS` |
-| `p3-symmetric` advisory floor (GHSA-3g92-f9ch-qjcm) | `shroud_plonky3::PINNED_P3_SYMMETRIC_VERSION` (build-time-derived) → `check_advisory` |
+| `p3-symmetric` advisory (GHSA-3g92-f9ch-qjcm, last affected = `0.5.2`) | `shroud_plonky3::PINNED_P3_SYMMETRIC_PROVENANCE` (build-time-derived) → `check_advisory` |
 | `input_mmcs_hiding == true` | `verify_profile_matches_backend` → `BackendDriftError::NonHidingInputMmcs` |
 | `fri_mmcs_hiding == true` | `verify_profile_matches_backend` → `BackendDriftError::NonHidingFriMmcs` |
 | Composite hiding technique present | `required_plonky3_hiding_techniques()` → `BackendDriftError::MissingHidingTechnique` |
@@ -95,10 +95,11 @@ The `shroud-plonky3` crate pins constants the verifier re-derives independently 
 
 ### Hash-suite advisory enforcement (GHSA-3g92-f9ch-qjcm)
 
-`p3-symmetric < 0.6` admits sponge-length collisions when an attacker can vary the number of hashed elements. SHROUD's `TranscriptBinding` payloads are length-prefixed throughout, which mitigates the attack surface, but `shroud-plonky3` treats the advisory floor as a **type-level precondition derived from reality**:
+`p3-symmetric <= 0.5.2` admits sponge-length collisions when an attacker can vary the number of hashed elements. SHROUD's `TranscriptBinding` payloads are length-prefixed throughout, which mitigates the attack surface, but `shroud-plonky3` treats the advisory as a **type-level precondition derived from reality**:
 
-- `crates/shroud-plonky3/build.rs` parses the workspace `Cargo.lock` and emits `SHROUD_P3_SYM_{MAJOR,MINOR,PATCH}` as `cargo:rustc-env` variables.
-- `PINNED_P3_SYMMETRIC_VERSION: P3SymmetricVersion` is a `pub const` built from those env vars via a `const fn parse_const_u64`. The version reflects the actually-resolved dependency, not a caller claim.
+- `crates/shroud-plonky3/build.rs` parses the workspace `Cargo.lock` and emits `SHROUD_P3_SYM_{MAJOR,MINOR,PATCH,SOURCE_KIND_CODE,CHECKSUM,GIT_URL,GIT_REV}` as `cargo:rustc-env` variables.
+- `PINNED_P3_SYMMETRIC_PROVENANCE: P3SymmetricProvenance` is a `pub const` built from those env vars via `const fn` parsing. The provenance (kind, version, checksum/rev) reflects the actually-resolved dependency, not a caller claim.
+- The advisory floor is encoded as **`LAST_AFFECTED = 0.5.2`** (a fact about the past), not `MIN_PATCHED = 0.6.0` (which would have rejected a hypothetical legitimate `0.5.3` patch release). `is_patched()` returns `true` iff version is **strictly greater than** `LAST_AFFECTED`.
 - `verify_profile_matches_backend(profile)` takes no version argument. The advisory check fires first — before any profile drift check — because without a patched hash, every other check is built on quicksand.
 - An earlier API exposed a `p3_symmetric: P3SymmetricVersion` parameter, which let callers declare a patched version against an unpatched graph. That trust hole is closed by removing the parameter.
 
@@ -117,8 +118,10 @@ pub enum P3SymmetricProvenance {
 
 `check_advisory()` passes iff **either**:
 
-1. The source is `Registry` and `version >= 0.6.0`, OR
-2. The source is `Git` AND the resolved `(source_url, rev)` pair matches an entry in `shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES`.
+1. The source is `Registry` and `version > 0.5.2` (i.e., strictly greater than `LAST_AFFECTED`), OR
+2. The source is `Git` AND the resolved `(source_url, rev)` pair matches an entry in `shroud_plonky3::KNOWN_PATCHED_P3_SYMMETRIC_SOURCES` — regardless of declared version.
+
+**Lying-fork defense.** Git semver is *unauthenticated* — a fork author can put any version string in their `Cargo.toml`. The gate never accepts a git source by version alone, even if the fork declares `version = "0.7.0"`. The allowlist match on `(source_url, rev)` is the only acceptance path for git provenance.
 
 **Source-conflation defense.** Pointing `p3-zk-proofs` at a Plonky3 commit with the `Pad10Sponge` patch does NOT change `p3-symmetric`'s own resolved source — Cargo still pulls `p3-symmetric` from `crates.io` unless an explicit `[patch.crates-io]` redirect targets `p3-symmetric` itself. The provenance gate therefore inspects `p3-symmetric`'s own entry, never `p3-zk-proofs`'s revision. This closes the trap of "the bridge crate is on a patched commit therefore the underlying hash must be patched."
 
@@ -129,7 +132,7 @@ pub enum P3SymmetricProvenance {
 - a co-sign from someone other than the bumper,
 - a `[patch.crates-io]` redirect in workspace `Cargo.toml` actually pointing `p3-symmetric` at the reviewed commit.
 
-The `known_patched_sources_allowlist_starts_empty` test fails when entries are added — CI failure is the trigger to re-review what was added and why. The `verify_provenance_*` tests exercise the gate logic with synthetic provenance + allowlist values: Registry-version-bump path, Git-allowlist-match path, matching-URL-wrong-rev rejection, matching-rev-wrong-URL rejection, and rejection of unallowlisted Git sources even when they self-declare `version >= 0.6.0`.
+The `known_patched_sources_allowlist_starts_empty` test fails when entries are added — CI failure is the trigger to re-review what was added and why. The `verify_provenance_*` tests exercise the gate logic with synthetic provenance + allowlist values: Registry-version-bump path, Git-allowlist-match path, matching-URL-wrong-rev rejection, matching-rev-wrong-URL rejection, and rejection of unallowlisted Git sources even when they self-declare a patched-looking version.
 
 ---
 
