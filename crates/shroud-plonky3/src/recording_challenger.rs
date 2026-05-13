@@ -60,6 +60,30 @@ pub type PinnedByteChallenger = HashChallenger<u8, PinnedByteHash, 32>;
 
 // ── ByteRecorder + RecorderSnapshot ──────────────────────────────────────────
 
+/// A single observe/sample call recorded by [`RecordingByteChallenger`].
+///
+/// Used by [`verify_byte_equivalence`] to replay the production challenger's
+/// transcript through a fresh challenger and assert that every sampled byte
+/// matches what the production challenger produced. This is the
+/// byte-faithfulness invariant pass 2 (item 4b) establishes.
+///
+/// Why a structured event log and not just the absorbed/sampled tapes:
+/// `HashChallenger`'s `sample()` flushes its input buffer, hashes it, and
+/// CHAINS the output back into the input buffer. So an intermediate sample
+/// between two observation phases mutates the challenger state in a way
+/// that prefix-only replay (just feeding the absorbed bytes into a fresh
+/// challenger) cannot reproduce. Replay must therefore see the exact
+/// observe/sample interleaving — which the event log preserves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ByteTranscriptEvent {
+    /// One `observe(...)` call on the byte-level inner challenger.
+    /// Carries every byte that the call placed into the input buffer.
+    Observed(Vec<u8>),
+    /// One `sample(...)` call on the byte-level inner challenger.
+    /// Carries the byte the sampler returned.
+    Sampled(Vec<u8>),
+}
+
 /// A cloneable, thread-safe handle on the byte tape captured by a
 /// [`RecordingByteChallenger`].
 ///
@@ -68,10 +92,22 @@ pub type PinnedByteChallenger = HashChallenger<u8, PinnedByteHash, 32>;
 /// `Rc<RefCell<>>` because Plonky3's [`p3_challenger::FieldChallenger`]
 /// trait requires `Sync`, which `Rc` does not satisfy. The mutex overhead
 /// is negligible at byte-granularity recording (one lock per `observe()`).
+///
+/// Three parallel views of the same recording:
+///
+/// - `absorbed_bytes()` — flat byte tape of everything observed. Used by
+///   SHROUD to build [`shroud_core::TranscriptBinding`] payloads.
+/// - `sampled_bytes()` — flat byte tape of everything sampled. Used by the
+///   replay harness to compare against re-derived sampled bytes.
+/// - `events()` — ordered observe/sample event log. Used by
+///   [`verify_byte_equivalence`] for the byte-faithfulness test, which
+///   needs the exact interleaving (samples chain state into the hash, so
+///   prefix-only replay is insufficient — see [`ByteTranscriptEvent`]).
 #[derive(Clone, Default, Debug)]
 pub struct ByteRecorder {
     absorbed: Arc<Mutex<Vec<u8>>>,
     sampled: Arc<Mutex<Vec<u8>>>,
+    events: Arc<Mutex<Vec<ByteTranscriptEvent>>>,
 }
 
 impl ByteRecorder {
@@ -158,6 +194,26 @@ impl ByteRecorder {
     pub fn sampled_len(&self) -> usize {
         self.sampled.lock().expect("byte-tape mutex poisoned").len()
     }
+
+    /// Returns the ordered observe/sample event log.
+    ///
+    /// Each entry corresponds to one call into the byte-level inner
+    /// challenger ([`ByteTranscriptEvent::Observed`] for `observe(...)`,
+    /// [`ByteTranscriptEvent::Sampled`] for `sample()`). The event log is
+    /// the input to [`verify_byte_equivalence`].
+    #[must_use]
+    pub fn events(&self) -> Vec<ByteTranscriptEvent> {
+        self.events
+            .lock()
+            .expect("byte-tape mutex poisoned")
+            .clone()
+    }
+
+    /// Number of observe/sample events currently recorded.
+    #[must_use]
+    pub fn events_len(&self) -> usize {
+        self.events.lock().expect("byte-tape mutex poisoned").len()
+    }
 }
 
 /// Snapshot of [`ByteRecorder`] cursor positions, taken by
@@ -213,6 +269,11 @@ impl<C: CanObserve<u8>> CanObserve<u8> for RecordingByteChallenger<C> {
             .lock()
             .expect("byte-tape mutex poisoned")
             .push(value);
+        self.recorder
+            .events
+            .lock()
+            .expect("byte-tape mutex poisoned")
+            .push(ByteTranscriptEvent::Observed(vec![value]));
         self.inner.observe(value);
     }
 }
@@ -224,6 +285,11 @@ impl<C: CanObserve<[u8; N]>, const N: usize> CanObserve<[u8; N]> for RecordingBy
             .lock()
             .expect("byte-tape mutex poisoned")
             .extend_from_slice(&values);
+        self.recorder
+            .events
+            .lock()
+            .expect("byte-tape mutex poisoned")
+            .push(ByteTranscriptEvent::Observed(values.to_vec()));
         self.inner.observe(values);
     }
 }
@@ -236,6 +302,11 @@ impl<C: CanSample<u8>> CanSample<u8> for RecordingByteChallenger<C> {
             .lock()
             .expect("byte-tape mutex poisoned")
             .push(v);
+        self.recorder
+            .events
+            .lock()
+            .expect("byte-tape mutex poisoned")
+            .push(ByteTranscriptEvent::Sampled(vec![v]));
         v
     }
 }
@@ -295,6 +366,84 @@ pub fn new_pinned_recording_byte_challenger() -> (PinnedRecordingByteChallenger,
     let byte_challenger = HashChallenger::<u8, PinnedByteHash, 32>::new(Vec::new(), Keccak256Hash);
     let recording = RecordingByteChallenger::new(byte_challenger, recorder.clone());
     (recording, recorder)
+}
+
+// ── Byte-equivalence replay ──────────────────────────────────────────────────
+
+/// First detected mismatch when replaying a [`ByteTranscriptEvent`] log
+/// through a fresh challenger.
+///
+/// Returned by [`verify_byte_equivalence`]. The fields identify the exact
+/// event and byte position where the recorded transcript and the replay
+/// diverged — useful for triaging "which observation changed the state"
+/// when a replay test fails after a code change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayMismatch {
+    /// Index of the [`ByteTranscriptEvent::Sampled`] event in the log
+    /// where the divergence was detected.
+    pub event_index: usize,
+    /// Byte position WITHIN the sampled event where the divergence
+    /// occurred (a `Sampled(...)` event may carry multiple bytes if the
+    /// caller batches them).
+    pub byte_index: usize,
+    /// Sampled byte recorded by the original challenger.
+    pub expected: u8,
+    /// Sampled byte produced by the replay challenger.
+    pub actual: u8,
+}
+
+impl core::fmt::Display for ReplayMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "byte-equivalence replay diverged at event {} byte {}: \
+             original challenger sampled 0x{:02x}, replay sampled 0x{:02x}",
+            self.event_index, self.byte_index, self.expected, self.actual,
+        )
+    }
+}
+
+impl std::error::Error for ReplayMismatch {}
+
+/// Replays an observe/sample event log through a fresh
+/// `HashChallenger<u8, Keccak256Hash, 32>` and asserts that every sampled
+/// byte matches the recorded value.
+///
+/// This is the byte-faithfulness invariant for item 4b: given a transcript
+/// the production challenger produced, a fresh challenger fed the same
+/// observe calls in the same order MUST produce the same sampled bytes.
+/// If it doesn't, either the recording is incomplete (missing an event),
+/// the replay logic differs from the production challenger, or the
+/// challenger itself is non-deterministic — all of which break the
+/// SHROUD ↔ Plonky3 bridge replay assumption.
+///
+/// Returns `Ok(())` on byte-equivalent replay, or [`ReplayMismatch`] at
+/// the first divergence. The fresh challenger is discarded after replay.
+pub fn verify_byte_equivalence(events: &[ByteTranscriptEvent]) -> Result<(), ReplayMismatch> {
+    let mut challenger = HashChallenger::<u8, PinnedByteHash, 32>::new(Vec::new(), Keccak256Hash);
+    for (event_index, event) in events.iter().enumerate() {
+        match event {
+            ByteTranscriptEvent::Observed(bytes) => {
+                for byte in bytes {
+                    challenger.observe(*byte);
+                }
+            }
+            ByteTranscriptEvent::Sampled(expected_bytes) => {
+                for (byte_index, &expected) in expected_bytes.iter().enumerate() {
+                    let actual: u8 = challenger.sample();
+                    if actual != expected {
+                        return Err(ReplayMismatch {
+                            event_index,
+                            byte_index,
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -502,5 +651,230 @@ mod tests {
         let snap = recorder.snapshot();
         assert_eq!(snap.absorbed_len, 2);
         assert_eq!(snap.sampled_len, 0);
+    }
+
+    // ── Event log capture ───────────────────────────────────────────────────
+
+    #[test]
+    fn events_log_captures_observe_in_order() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        byte_challenger.observe(0x11u8);
+        byte_challenger.observe([0x22u8, 0x33, 0x44]);
+        byte_challenger.observe(0x55u8);
+
+        assert_eq!(
+            recorder.events(),
+            vec![
+                ByteTranscriptEvent::Observed(vec![0x11]),
+                ByteTranscriptEvent::Observed(vec![0x22, 0x33, 0x44]),
+                ByteTranscriptEvent::Observed(vec![0x55]),
+            ]
+        );
+    }
+
+    #[test]
+    fn events_log_captures_interleaved_observe_sample() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        byte_challenger.observe(0xAAu8);
+        let _: u8 = byte_challenger.sample();
+        byte_challenger.observe(0xBBu8);
+        let _: u8 = byte_challenger.sample();
+
+        let events = recorder.events();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], ByteTranscriptEvent::Observed(_)));
+        assert!(matches!(events[1], ByteTranscriptEvent::Sampled(_)));
+        assert!(matches!(events[2], ByteTranscriptEvent::Observed(_)));
+        assert!(matches!(events[3], ByteTranscriptEvent::Sampled(_)));
+    }
+
+    #[test]
+    fn events_len_tracks_call_count() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        assert_eq!(recorder.events_len(), 0);
+        byte_challenger.observe(0x01u8);
+        assert_eq!(recorder.events_len(), 1);
+        let _: u8 = byte_challenger.sample();
+        assert_eq!(recorder.events_len(), 2);
+    }
+
+    // ── Byte-equivalence replay (the security invariant) ────────────────────
+
+    /// **Critical correctness test.** The byte-faithfulness invariant: a
+    /// recorded event log replayed through a fresh challenger must produce
+    /// the same sampled bytes the original challenger produced. If this
+    /// fails, SHROUD's transcript-replay verification of Plonky3 proofs is
+    /// fundamentally broken — the bridge cannot honestly verify
+    /// challenge-bytes match.
+    #[test]
+    fn byte_equivalence_holds_for_real_observe_sample_pattern() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+
+        // Pattern that mirrors a real prove flow: observe metadata, sample
+        // an alpha-shaped batch of bytes, observe more, sample again.
+        for b in [0x01u8, 0x02, 0x03, 0x04, 0x05] {
+            byte_challenger.observe(b);
+        }
+        for _ in 0..4 {
+            let _: u8 = byte_challenger.sample();
+        }
+        for b in [0x10u8, 0x20, 0x30] {
+            byte_challenger.observe(b);
+        }
+        for _ in 0..2 {
+            let _: u8 = byte_challenger.sample();
+        }
+
+        // The event log MUST replay byte-equivalently through a fresh
+        // challenger.
+        verify_byte_equivalence(&recorder.events())
+            .expect("byte-equivalent replay must succeed for an honestly-recorded transcript");
+    }
+
+    #[test]
+    fn byte_equivalence_holds_through_serializing_typed_observations() {
+        // Same byte-faithfulness invariant, but observations go through
+        // the SerializingChallenger32 typed surface (Val observations
+        // serialize to 4 LE bytes each). The byte tape captures the
+        // post-serialization bytes, so replay must work identically.
+        let (mut recording, recorder) = new_pinned_recording_challenger();
+
+        for v in [
+            Val::from_u32(0x12345678),
+            Val::from_u32(0xabcdef00),
+            Val::from_u32(0x00000001),
+        ] {
+            CanObserve::<Val>::observe(&mut recording, v);
+        }
+        for _ in 0..4 {
+            let _: BinomialExtensionField<Val, 4> = recording.sample_algebra_element();
+        }
+        CanObserve::<Val>::observe(&mut recording, Val::from_u32(0xdeadbeef));
+        let _: usize = recording.sample_bits(16);
+
+        verify_byte_equivalence(&recorder.events())
+            .expect("byte-equivalent replay must succeed for typed prove flow");
+    }
+
+    /// Negative: if one observation byte is mutated in the event log, the
+    /// replay must reject the next sample. This proves the replay isn't
+    /// trivially passing — it actually compares.
+    #[test]
+    fn byte_equivalence_rejects_mutated_observation() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        for b in [0x01u8, 0x02, 0x03] {
+            byte_challenger.observe(b);
+        }
+        for _ in 0..3 {
+            let _: u8 = byte_challenger.sample();
+        }
+
+        // Mutate one byte in an Observed event in the log.
+        let mut events = recorder.events();
+        match &mut events[0] {
+            ByteTranscriptEvent::Observed(bytes) => bytes[0] ^= 0xFF,
+            other => panic!("first event must be Observed, got {other:?}"),
+        }
+
+        let err = verify_byte_equivalence(&events)
+            .expect_err("mutated observation must cause replay divergence");
+        assert!(
+            err.event_index >= 3,
+            "divergence must be at a Sampled event"
+        );
+    }
+
+    /// Negative: if one recorded "expected" sampled byte is mutated in the
+    /// event log, the replay must reject it. Proves the replay's compare
+    /// step actually fires.
+    #[test]
+    fn byte_equivalence_rejects_mutated_sampled_byte() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        byte_challenger.observe(0xAAu8);
+        let _: u8 = byte_challenger.sample();
+        let _: u8 = byte_challenger.sample();
+
+        let mut events = recorder.events();
+        // Find and mutate the first Sampled event.
+        let mutated_index = events
+            .iter_mut()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                ByteTranscriptEvent::Sampled(bytes) => {
+                    bytes[0] ^= 0xFF;
+                    Some(i)
+                }
+                _ => None,
+            })
+            .expect("must contain a Sampled event");
+
+        let err = verify_byte_equivalence(&events)
+            .expect_err("mutated sampled byte must cause replay divergence");
+        assert_eq!(err.event_index, mutated_index);
+        assert_eq!(err.byte_index, 0);
+    }
+
+    /// Negative: removing one Observed event from the log shifts the
+    /// challenger state and must cause replay divergence at the next
+    /// sample.
+    #[test]
+    fn byte_equivalence_rejects_dropped_observation() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        for b in [0x01u8, 0x02, 0x03] {
+            byte_challenger.observe(b);
+        }
+        for _ in 0..3 {
+            let _: u8 = byte_challenger.sample();
+        }
+
+        let mut events = recorder.events();
+        events.remove(0); // drop the first Observed
+
+        assert!(
+            verify_byte_equivalence(&events).is_err(),
+            "dropped observation must break byte equivalence"
+        );
+    }
+
+    /// Negative: swapping the order of two Observed events that happen
+    /// BEFORE a sample changes the absorbed sequence, which must change
+    /// the sampled bytes (because HashChallenger absorbs in order).
+    #[test]
+    fn byte_equivalence_rejects_reordered_observations() {
+        let (mut byte_challenger, recorder) = new_pinned_recording_byte_challenger();
+        byte_challenger.observe(0x01u8);
+        byte_challenger.observe(0x02u8);
+        byte_challenger.observe(0x03u8);
+        for _ in 0..2 {
+            let _: u8 = byte_challenger.sample();
+        }
+
+        let mut events = recorder.events();
+        events.swap(0, 2); // swap first and third Observed events
+
+        assert!(
+            verify_byte_equivalence(&events).is_err(),
+            "reordering observations must break byte equivalence"
+        );
+    }
+
+    #[test]
+    fn replay_mismatch_display_includes_position_and_bytes() {
+        let mismatch = ReplayMismatch {
+            event_index: 5,
+            byte_index: 2,
+            expected: 0xAB,
+            actual: 0xCD,
+        };
+        let msg = mismatch.to_string();
+        assert!(msg.contains("event 5"));
+        assert!(msg.contains("byte 2"));
+        assert!(msg.contains("ab")); // expected
+        assert!(msg.contains("cd")); // actual
+    }
+
+    #[test]
+    fn empty_event_log_replays_trivially() {
+        assert!(verify_byte_equivalence(&[]).is_ok());
     }
 }

@@ -57,10 +57,10 @@ pub use extended_bindings::{
     DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT, Plonky3UniStarkBindings,
 };
 pub use recording_challenger::{
-    ByteRecorder, PinnedByteChallenger, PinnedByteHash, PinnedRecordingByteChallenger,
-    PinnedRecordingChallenger, RecorderSnapshot, RecordingByteChallenger,
-    new_pinned_control_challenger, new_pinned_recording_byte_challenger,
-    new_pinned_recording_challenger,
+    ByteRecorder, ByteTranscriptEvent, PinnedByteChallenger, PinnedByteHash,
+    PinnedRecordingByteChallenger, PinnedRecordingChallenger, RecorderSnapshot,
+    RecordingByteChallenger, ReplayMismatch, new_pinned_control_challenger,
+    new_pinned_recording_byte_challenger, new_pinned_recording_challenger, verify_byte_equivalence,
 };
 
 // ── Pinned backend constants ─────────────────────────────────────────────────
