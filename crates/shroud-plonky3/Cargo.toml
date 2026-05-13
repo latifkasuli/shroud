@@ -21,8 +21,18 @@ git = "https://github.com/latifkasuli/p3-zk-proofs.git"
 rev = "d0c9fbc54e2314a90edd6a6ef84055c1179a4754"
 
 [dev-dependencies]
-# Test-only: extension-field arithmetic for transparency tests.
+# Test-only: extension-field arithmetic for transparency tests, plus the
+# Plonky3 ecosystem for the live uni-stark recorder smoke test
+# (tests/live_uni_stark_recorder_smoke.rs).
 p3-field = "0.5.2"
+p3-air = "0.5.2"
+p3-commit = "0.5.2"
+p3-dft = "0.5.2"
+p3-fri = "0.5.2"
+p3-matrix = "0.5.2"
+p3-merkle-tree = "0.5.2"
+p3-symmetric = "0.5.2"
+p3-uni-stark = "0.5.2"
 shroud-batch-opening = { path = "../shroud-batch-opening" }
 shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
 shroud-opening-projection = { path = "../shroud-opening-projection" }

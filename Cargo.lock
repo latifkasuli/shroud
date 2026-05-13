@@ -888,10 +888,18 @@ dependencies = [
 name = "shroud-plonky3"
 version = "0.1.0"
 dependencies = [
+ "p3-air",
  "p3-baby-bear",
  "p3-challenger",
+ "p3-commit",
+ "p3-dft",
  "p3-field",
+ "p3-fri",
  "p3-keccak",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-symmetric",
+ "p3-uni-stark",
  "p3-zk-proofs",
  "shroud-batch-opening",
  "shroud-codeword-embedding",
