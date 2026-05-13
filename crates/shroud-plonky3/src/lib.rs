@@ -48,6 +48,7 @@ use shroud_reference::ReferenceHidingFriPcsProfile;
 
 pub mod extended_bindings;
 pub mod recording_challenger;
+pub mod replay_harness;
 
 pub use extended_bindings::{
     DOMAIN_PLONKY3_AIR_PUBLIC_VALUES, DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS,
@@ -62,6 +63,7 @@ pub use recording_challenger::{
     RecordingByteChallenger, ReplayMismatch, new_pinned_control_challenger,
     new_pinned_recording_byte_challenger, new_pinned_recording_challenger, verify_byte_equivalence,
 };
+pub use replay_harness::{HarnessError, Plonky3ReplayHarness};
 
 // ── Pinned backend constants ─────────────────────────────────────────────────
 
