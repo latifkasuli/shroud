@@ -33,6 +33,9 @@ p3-matrix = "0.5.2"
 p3-merkle-tree = "0.5.2"
 p3-symmetric = "0.5.2"
 p3-uni-stark = "0.5.2"
+# Deterministic RNG for hiding-MMCS salts and HidingFriPcs random codewords
+# in tests/live_hiding_fri_recorder.rs.
+rand = "0.10"
 shroud-batch-opening = { path = "../shroud-batch-opening" }
 shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
 shroud-opening-projection = { path = "../shroud-opening-projection" }

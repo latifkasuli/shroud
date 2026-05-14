@@ -901,6 +901,7 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "p3-zk-proofs",
+ "rand 0.10.1",
  "shroud-batch-opening",
  "shroud-codeword-embedding",
  "shroud-core",
