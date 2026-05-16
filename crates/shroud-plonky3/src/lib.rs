@@ -47,6 +47,8 @@ use shroud_core::{HashIdentifier, HidingTechniqueClaim, TranscriptBindable, Tran
 use shroud_reference::ReferenceHidingFriPcsProfile;
 
 pub mod extended_bindings;
+pub mod live_extractor;
+pub mod live_harness;
 pub mod recording_challenger;
 pub mod replay_harness;
 
@@ -56,6 +58,13 @@ pub use extended_bindings::{
     DOMAIN_PLONKY3_LOG_EXT_DEGREE, DOMAIN_PLONKY3_OPENED_VALUES,
     DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT, DOMAIN_PLONKY3_PREPROCESSED_WIDTH,
     DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT, Plonky3UniStarkBindings,
+};
+pub use live_extractor::{
+    LiveExtractionError, LiveExtractorShape, LivePreGrindExtraction, extract_pre_grind_slices,
+    longest_byte_equivalent_prefix,
+};
+pub use live_harness::{
+    Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput, build_pre_grind_harness_input,
 };
 pub use recording_challenger::{
     ByteRecorder, ByteTranscriptEvent, PinnedByteChallenger, PinnedByteHash,

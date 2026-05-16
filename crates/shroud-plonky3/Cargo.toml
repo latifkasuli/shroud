@@ -9,6 +9,14 @@ build = "build.rs"
 [dependencies]
 shroud-core = { path = "../shroud-core" }
 shroud-reference = { path = "../shroud-reference" }
+# Protocol-spec crates: needed by `src/live_harness.rs` so the
+# production builder can take SHROUD protocol-spec objects as inputs.
+# (Previously dev-only when the live-bridge code lived under tests/.)
+shroud-batch-opening = { path = "../shroud-batch-opening" }
+shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
+shroud-opening-projection = { path = "../shroud-opening-projection" }
+shroud-oracle-commitment = { path = "../shroud-oracle-commitment" }
+shroud-quotient-hider = { path = "../shroud-quotient-hider" }
 # Plonky3 transitively-pinned via p3-zk-proofs; declared directly so the
 # RecordingByteChallenger module can import the trait surface without
 # routing every type alias through p3_zk_proofs::backend.
@@ -36,11 +44,6 @@ p3-uni-stark = "0.5.2"
 # Deterministic RNG for hiding-MMCS salts and HidingFriPcs random codewords
 # in tests/live_hiding_fri_recorder.rs.
 rand = "0.10"
-shroud-batch-opening = { path = "../shroud-batch-opening" }
-shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
-shroud-opening-projection = { path = "../shroud-opening-projection" }
-shroud-oracle-commitment = { path = "../shroud-oracle-commitment" }
-shroud-quotient-hider = { path = "../shroud-quotient-hider" }
 
 [lib]
 path = "src/lib.rs"

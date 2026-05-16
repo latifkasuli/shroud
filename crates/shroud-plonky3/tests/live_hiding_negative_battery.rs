@@ -2,46 +2,32 @@
 //! adversarial threat classes from `docs/security-model.md §2-§5`
 //! against real `HidingFriPcs` prove output, not synthetic fixtures.
 //!
-//! This is the bridge between phase 2b (live recorder works) and the
-//! synthetic [`Plonky3ReplayHarness`] tests in `replay_harness.rs`. It
-//! adds:
+//! This is the integration counterpart to the unit tests in
+//! [`shroud_plonky3::live_extractor`] and
+//! [`shroud_plonky3::live_harness`]: the extractor and harness builder
+//! now live in production code, and this file is the live-stack
+//! integration test that drives them with real recorder output.
 //!
-//! 1. A LIVE EXTRACTOR that slices the recorder's pre-grind event log
-//!    into the named SHROUD-stage byte ranges
-//!    (`instance_metadata`, `trace_commit`, `quotient_commit`,
-//!    `randomizer_commit`) by walking observed bytes at deterministic
-//!    offsets derived from `uni-stark/src/prover.rs`.
+//! # What this file proves
 //!
-//! 2. A LIVE FIXTURE that composes those slices with the canonical
-//!    `StandardBatchOpeningBindings` + `Plonky3UniStarkBindings` →
-//!    `TranscriptBindingManifest` → `ReferenceBindingRecord` chain,
-//!    producing a real-data tuple the harness can verify against.
-//!
-//! 3. A negative battery: one mutation per threat class, each
-//!    asserting the harness rejects with the correct `HarnessError`
-//!    variant and (where applicable) the correct domain label.
+//! 1. The production [`extract_pre_grind_slices`] walks a real
+//!    `HidingFriPcs` recorder log without panicking and produces the
+//!    expected byte slices.
+//! 2. The production [`build_pre_grind_harness_input`] composes those
+//!    live slices into a [`Plonky3LiveHarnessInput`] that
+//!    [`Plonky3ReplayHarness`] accepts.
+//! 3. Mutations corresponding to each `docs/security-model.md §2-§5`
+//!    threat class are rejected with the correct [`HarnessError`]
+//!    variant — on **live** data, not synthetic fixtures.
 //!
 //! # Scope
 //!
-//! Pre-grind SHROUD-stage events only. Post-zeta Plonky3 slots
-//! (`opened_values`, `fri_*`) are filled with placeholder bytes — the
-//! manifest expects them and the record absorbs them, so manifest
-//! verification passes, but they don't correspond to live data. The
-//! threat coverage is on the pre-grind / pre-zeta portion of the
-//! transcript, which is exactly the SHROUD-binding-layer scope.
-//!
-//! Phase 3 (`prove_with_recording_challenger`) will extend this to
-//! live post-grind data once the clone-pollution issue is closed.
-//!
-//! # Why this matters
-//!
-//! Phase 2b proved the recorder captures real bytes. The synthetic
-//! harness tests proved the harness logic is correct. **This file is
-//! the first place those two facts compose against each other** — a
-//! real prove invocation feeds the harness, and the harness's
-//! adversarial assertions fire on real prove data. Every threat class
-//! the security-model doc claims SHROUD defends against now has a
-//! live-stack assertion proving it.
+//! Pre-grind SHROUD-stage events only. Post-zeta Plonky3 slots use
+//! placeholder bytes; the manifest expects them and the record absorbs
+//! them, so manifest verification passes, but replay against the live
+//! prefix doesn't extend into the post-zeta region. Phase 3
+//! (`prove_with_recording_challenger`) will extend this once the
+//! clone-pollution issue is closed.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_baby_bear::BabyBear;
@@ -62,8 +48,8 @@ use shroud_batch_opening::{BatchOpeningShape, ShroudBatchOpeningSpec};
 use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
 use shroud_core::{
     BasisDescriptor, DOMAIN_HASH_ID, DOMAIN_RANDOMIZER_COMMITMENT, HashIdentifier,
-    PublicOpeningBinding, SecurityLevel, StandardBatchOpeningBindings, TranscriptBindable,
-    TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest,
+    PublicOpeningBinding, SecurityLevel, TranscriptBindable, TranscriptBinding,
+    TranscriptBindingError,
 };
 use shroud_opening_projection::{
     AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
@@ -74,14 +60,15 @@ use shroud_oracle_commitment::{
 use shroud_plonky3::{
     BACKEND_LOG_BLOWUP, BACKEND_NUM_RANDOMIZER_COLS, ByteRecorder, ByteTranscriptEvent,
     DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT, HarnessError,
-    Plonky3HashIdentifier, Plonky3ReplayHarness, Plonky3UniStarkBindings, RecordingByteChallenger,
-    new_pinned_recording_challenger, verify_byte_equivalence,
+    LiveExtractorShape, Plonky3HashIdentifier, Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput,
+    Plonky3ReplayHarness, RecordingByteChallenger, build_pre_grind_harness_input,
+    extract_pre_grind_slices, longest_byte_equivalent_prefix, new_pinned_recording_challenger,
 };
 use shroud_quotient_hider::{
     QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
     QuotientHiderShape, ShroudQuotientHiderSpec,
 };
-use shroud_reference::{ReferenceBindingRecord, ReferenceHidingFriPcsProfile};
+use shroud_reference::ReferenceBindingRecord;
 
 // ── Minimal AIR ──────────────────────────────────────────────────────────────
 
@@ -168,179 +155,15 @@ fn make_recording_hiding_config() -> (MyConfig, ByteRecorder) {
     (MyConfig::new(pcs, challenger), recorder)
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Live fixture (drives the production builder against live bytes) ──────────
 
-fn longest_byte_equivalent_prefix(events: &[ByteTranscriptEvent]) -> usize {
-    let mut lo = 0;
-    let mut hi = events.len();
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if verify_byte_equivalence(&events[..mid]).is_ok() {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
-}
-
-/// SHROUD-stage byte slices extracted by *structurally* walking the
-/// recorder event log — NOT by flattening observed bytes and slicing
-/// at fixed offsets.
-///
-/// `SerializingChallenger32<Val, HashChallenger<u8, _, 32>>` observes
-/// bytes through the byte-oriented `CanObserve<u8>` path, so each
-/// logical "observe a u32" or "observe an MMCS commitment" lands as a
-/// run of `Observed(1)` events (or batched `Observed(N)` for some N)
-/// in the recorder. Whatever the batching factor, the structural
-/// invariant we audit is:
-///
-/// 1. **Contiguous run of Observed events totalling 4 bytes** —
-///    log_ext_degree (uni-stark/src/prover.rs line 163)
-/// 2. **Contiguous run** totalling 4 bytes — log_degree (line 164)
-/// 3. **Contiguous run** totalling 4 bytes — preprocessed_width (line 165)
-/// 4. **Contiguous run** totalling 32 bytes — trace_commit (line 169;
-///    SquareAir has no preprocessed cols, line 171, and we pass empty
-///    public values, line 175, so this is the next observed block)
-/// 5. **≥1 `Sampled(*)` events** — α extension-element sample (line 197)
-/// 6. **Contiguous run** totalling 32 bytes — quotient_commit (line 258)
-/// 7. **Contiguous run** totalling 32 bytes — randomizer_commit
-///    (line 286, ZK-only)
-/// 8. **≥1 `Sampled(*)` events** — ζ extension-element sample (line 300)
-///
-/// Crucially, `read_observed_block` REFUSES to cross a `Sampled`
-/// boundary or to overshoot its byte budget. So an inserted observe,
-/// a resized commit, a moved/dropped Sampled call, or a domain label
-/// landing on bytes that span an event boundary fails the extractor
-/// before any binding is wired up — closing the boundary-loss gap of
-/// the old offset-based slicer.
-struct LiveExtraction {
-    log_ext_degree: Vec<u8>,
-    log_degree: Vec<u8>,
-    preprocessed_width: Vec<u8>,
-    trace_commit: Vec<u8>,
-    quotient_commit: Vec<u8>,
-    randomizer_commit: Vec<u8>,
-}
-
-/// Read a contiguous run of `Observed` events from `iter` until
-/// `expected_len` bytes are accumulated. Fails if:
-/// - a `Sampled` event appears before the budget is filled
-///   (interrupted observe-block — Fiat-Shamir order violation);
-/// - the iterator is exhausted (truncated log);
-/// - a single `Observed` event would push us past `expected_len`
-///   (event boundary doesn't align with the logical block boundary —
-///   the domain label would attach to bytes crossing the boundary).
-fn read_observed_block(
-    iter: &mut std::iter::Peekable<std::slice::Iter<'_, ByteTranscriptEvent>>,
-    expected_len: usize,
-    name: &str,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(expected_len);
-    while out.len() < expected_len {
-        match iter.next() {
-            Some(ByteTranscriptEvent::Observed(bytes)) => {
-                assert!(
-                    out.len() + bytes.len() <= expected_len,
-                    "structural extractor: Observed event for {name} crosses block boundary \
-                     (had {} bytes, event adds {}, budget {})",
-                    out.len(),
-                    bytes.len(),
-                    expected_len
-                );
-                out.extend_from_slice(bytes);
-            }
-            Some(ByteTranscriptEvent::Sampled(bytes)) => {
-                panic!(
-                    "structural extractor: Sampled({}) interrupts observe-block for {name} \
-                     after {} of {} bytes — Fiat-Shamir order violation",
-                    bytes.len(),
-                    out.len(),
-                    expected_len
-                );
-            }
-            None => panic!(
-                "structural extractor: event log exhausted while reading {name} \
-                 (had {} of {} bytes)",
-                out.len(),
-                expected_len
-            ),
-        }
-    }
-    out
-}
-
-/// Consume ≥1 `Sampled` events. Fails if the next event is not a
-/// `Sampled` (production must sample a challenge here).
-fn read_sampled_block(
-    iter: &mut std::iter::Peekable<std::slice::Iter<'_, ByteTranscriptEvent>>,
-    challenge_name: &str,
-) {
-    let mut saw = false;
-    while let Some(ByteTranscriptEvent::Sampled(_)) = iter.peek() {
-        iter.next();
-        saw = true;
-    }
-    assert!(
-        saw,
-        "structural extractor: expected ≥1 Sampled events for {challenge_name}, found none"
-    );
-}
-
-fn extract_pre_grind_slices(events: &[ByteTranscriptEvent]) -> LiveExtraction {
-    let mut iter = events.iter().peekable();
-
-    // 1-4: instance metadata + trace commit. No preprocessed_commit
-    // because SquareAir has no preprocessed cols; air_public_values
-    // is empty because we pass &[] to prove. No Sampled may occur in
-    // this region.
-    let log_ext_degree = read_observed_block(&mut iter, 4, "log_ext_degree");
-    let log_degree = read_observed_block(&mut iter, 4, "log_degree");
-    let preprocessed_width = read_observed_block(&mut iter, 4, "preprocessed_width");
-    let trace_commit = read_observed_block(&mut iter, 32, "trace_commit");
-
-    // 5: α sample MUST fire between trace_commit and quotient_commit.
-    read_sampled_block(&mut iter, "α (batching challenge)");
-
-    // 6: quotient_commit (32B MMCS root).
-    let quotient_commit = read_observed_block(&mut iter, 32, "quotient_commit");
-
-    // 7: randomizer_commit (ZK-only, 32B MMCS root). No Sampled may
-    // occur between quotient_commit and randomizer_commit (this is the
-    // SHROUD-specific hiding-stack ordering invariant).
-    let randomizer_commit = read_observed_block(&mut iter, 32, "randomizer_commit");
-
-    // 8: ζ sample MUST follow randomizer_commit in the live prefix.
-    read_sampled_block(&mut iter, "ζ (OOD point)");
-
-    LiveExtraction {
-        log_ext_degree,
-        log_degree,
-        preprocessed_width,
-        trace_commit,
-        quotient_commit,
-        randomizer_commit,
-    }
-}
-
-// ── Live fixture builder ─────────────────────────────────────────────────────
-
-/// Everything a [`Plonky3ReplayHarness`] needs, built from a REAL
-/// `HidingFriPcs` prove invocation. Pre-zeta SHROUD-stage slots use
-/// live recorder bytes; post-zeta Plonky3 slots use placeholders.
+/// Holds owned protocol-spec values for the lifetime of one test
+/// invocation, plus the harness input built from live recorder bytes.
+/// The spec fields are owned here because
+/// [`Plonky3LiveHarnessConfig`] holds references — keeping them in a
+/// fixture struct gives the test a stable place to borrow from.
 struct LiveHidingFixture {
-    profile: ReferenceHidingFriPcsProfile,
-    record: ReferenceBindingRecord,
-    manifest: TranscriptBindingManifest,
-    prefix_events: Vec<ByteTranscriptEvent>,
-}
-
-/// Test-only `TranscriptBindable` wrapper for raw bindings.
-struct RawBindable(TranscriptBinding);
-impl TranscriptBindable for RawBindable {
-    fn to_transcript_binding(&self) -> TranscriptBinding {
-        self.0.clone()
-    }
+    input: Plonky3LiveHarnessInput,
 }
 
 fn build_live_hiding_fixture() -> LiveHidingFixture {
@@ -353,46 +176,15 @@ fn build_live_hiding_fixture() -> LiveHidingFixture {
     let longest = longest_byte_equivalent_prefix(&all_events);
     let prefix_events = all_events[..longest].to_vec();
 
-    // 2. Walk the recorder events STRUCTURALLY (no flatten-and-slice).
-    // The extractor asserts the exact pre-grind event shape from
-    // uni-stark/src/prover.rs; a drift in event count, size, or
-    // ordering fails the extractor before any binding is wired up.
-    let LiveExtraction {
-        log_ext_degree,
-        log_degree,
-        preprocessed_width,
-        trace_commit,
-        quotient_commit,
-        randomizer_commit,
-    } = extract_pre_grind_slices(&prefix_events);
+    // 2. Production extractor: structural event walk.
+    let extraction = extract_pre_grind_slices(&prefix_events, &LiveExtractorShape::standard())
+        .expect("live recorder events must extract cleanly");
 
-    // 3. Build Plonky3UniStarkBindings.
-    //
-    // Pre-zeta slots use live extracted bytes. Post-zeta slots
-    // (opened_values, fri_*) use deterministic placeholders — the
-    // manifest will expect these placeholder bytes, the record will
-    // absorb them, both match. The replay assertion uses prefix_events
-    // which doesn't extend into the post-zeta region, so the
-    // placeholder bytes don't affect byte-equivalence.
-    let bindings = Plonky3UniStarkBindings::new(
-        log_ext_degree,
-        log_degree,
-        preprocessed_width,
-        trace_commit,
-        vec![], // air_public_values — empty for our AIR
-        quotient_commit,
-        vec![0x00; 8], // opened_values placeholder
-        vec![0x01; 8], // fri_commit_phase_commitments placeholder
-        vec![0x02; 8], // fri_final_poly placeholder
-        vec![0x03; 8], // fri_log_arities placeholder
-    );
-
-    // 4. Build StandardBatchOpeningBindings — canonical SHROUD bindings.
-    // The randomizer_commitment binding uses LIVE bytes; everything else
-    // uses the canonical protocol-object derivations from
-    // shroud-{batch,codeword,oracle,opening,quotient}-* crates.
+    // 3. Build canonical SHROUD protocol-spec values. (Owned here; the
+    //    config below borrows them.)
+    let hash_identifier = Plonky3HashIdentifier::standard().to_hash_identifier();
+    let profile = shroud_reference::ReferenceHidingFriPcsProfile::standard();
     let basis = BasisDescriptor::plonky3_binomial(4);
-    let profile = ReferenceHidingFriPcsProfile::standard();
     let batch_spec =
         ShroudBatchOpeningSpec::statistical(BatchOpeningShape::new(4, 1, 2).expect("valid"), 15)
             .expect("valid");
@@ -419,113 +211,38 @@ fn build_live_hiding_fixture() -> LiveHidingFixture {
         Some(degree_contract),
     )
     .expect("valid");
-    let hash_identifier = Plonky3HashIdentifier::standard().to_hash_identifier();
-    // DOMAIN_RANDOMIZER_COMMITMENT carries the LIVE randomizer commit
-    // bytes extracted by the structural walker — this is the canonical
-    // SHROUD slot for the hiding-stack randomizer.
-    let randomizer = RawBindable(TranscriptBinding::new(
-        DOMAIN_RANDOMIZER_COMMITMENT,
-        randomizer_commit,
-    ));
-    let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]); // placeholder, post-zeta
+    let security_level = SecurityLevel::Statistical;
+    let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]);
 
-    let standard = StandardBatchOpeningBindings::from_bindables(
-        &hash_identifier,
-        &profile,
-        &basis,
-        &batch_spec,
-        &codeword_spec,
-        &oracle_spec,
-        &projection_spec,
-        &quotient_spec,
-        &SecurityLevel::Statistical,
-        &degree_contract,
-        &randomizer,
-        &public_openings,
-    );
+    // 4. Production builder.
+    let config = Plonky3LiveHarnessConfig {
+        hash_identifier: &hash_identifier,
+        profile: &profile,
+        basis: &basis,
+        batch_spec: &batch_spec,
+        codeword_spec: &codeword_spec,
+        oracle_spec: &oracle_spec,
+        projection_spec: &projection_spec,
+        quotient_spec: &quotient_spec,
+        security_level: &security_level,
+        degree_contract: &degree_contract,
+        public_openings: &public_openings,
+        opened_values: vec![0x00; 8],
+        fri_commit_phase_commitments: vec![0x01; 8],
+        fri_final_poly: vec![0x02; 8],
+        fri_log_arities: vec![0x03; 8],
+    };
 
-    // 5. Compose manifest = standard ⊕ plonky3 bindings.
-    let manifest = bindings.clone().into_manifest(standard);
+    let input = build_pre_grind_harness_input(&extraction, prefix_events, &config);
 
-    // 6. Build record in **Plonky3 transcript order** (not arbitrary
-    //    insertion order). The reviewer's P2 was: `absorb_into` plus
-    //    the canonical-SHROUD block placed `DOMAIN_RANDOMIZER_COMMITMENT`
-    //    before `DOMAIN_PLONKY3_QUOTIENT_COMMITMENT`, the reverse of
-    //    actual Plonky3 order (quotient → randomizer → ζ).
-    //
-    //    Two layers, made explicit:
-    //
-    //    (a) **Pre-protocol SHROUD config bindings** — these are
-    //        invariants of the SHROUD/Plonky3 deployment that have no
-    //        Plonky3 transcript counterpart (hash_id, profile, basis,
-    //        protocol specs, security_level, degree_contract). They
-    //        bind the verifier to a fixed configuration before any
-    //        prover-controlled byte enters the transcript.
-    //
-    //    (b) **Plonky3 transcript events**, in the order
-    //        `uni-stark/src/prover.rs` emits them with `Pcs::ZK = true`:
-    //        log_ext_degree, log_degree, preprocessed_width,
-    //        trace_commit, air_public_values, quotient_commit,
-    //        **randomizer_commit** (canonical SHROUD, slotted between
-    //        quotient and ζ-dependent events), opened_values, fri_*.
-    //
-    //    `ReferenceBindingRecord::finalize` still checks **unordered
-    //    presence** (per-stage exact-byte equality) — record order is
-    //    NOT the audit's transcript-order invariant; replay against
-    //    `prefix_events` is. But ordering the record to match
-    //    transcript order keeps the audit trail honest: nobody reading
-    //    the record can mistake its sequence for an out-of-order
-    //    Fiat-Shamir commit.
-    let mut record = ReferenceBindingRecord::new();
-
-    // (a) Pre-protocol SHROUD config bindings.
-    record.absorb_bindable(&hash_identifier);
-    record.absorb_bindable(&profile);
-    record.absorb_bindable(&basis);
-    record.absorb_bindable(&batch_spec);
-    record.absorb_bindable(&codeword_spec);
-    record.absorb_bindable(&oracle_spec);
-    record.absorb_bindable(&projection_spec);
-    record.absorb_bindable(&quotient_spec);
-    record.absorb_bindable(&SecurityLevel::Statistical);
-    record.absorb_bindable(&degree_contract);
-
-    // (b) Plonky3 transcript-order absorption.
-    record.absorb(bindings.log_ext_degree().clone());
-    record.absorb(bindings.log_degree().clone());
-    record.absorb(bindings.preprocessed_width().clone());
-    record.absorb(bindings.trace_commitment().clone());
-    if let Some(pre) = bindings.preprocessed_commitment() {
-        record.absorb(pre.clone());
-    }
-    record.absorb(bindings.air_public_values().clone());
-    // (sample α — no observed bytes between trace_commit and quotient_commit)
-    record.absorb(bindings.quotient_commitment().clone());
-    // DOMAIN_RANDOMIZER_COMMITMENT slots HERE — between QUOTIENT and ζ
-    // — matching the Plonky3 randomizer-commit event (event 9, ZK-only).
-    record.absorb_bindable(&randomizer);
-    // (sample ζ — no observed bytes between randomizer_commit and opened_values)
-    record.absorb(bindings.opened_values().clone());
-    record.absorb(bindings.fri_commit_phase_commitments().clone());
-    record.absorb(bindings.fri_final_poly().clone());
-    record.absorb(bindings.fri_log_arities().clone());
-
-    // public_openings is a SHROUD-canonical binding for the post-zeta
-    // public outputs; in our extended map it logically follows
-    // opened_values. Placed after the Plonky3 transcript-order block
-    // so it doesn't break the transcript-order audit narrative.
-    record.absorb_bindable(&public_openings);
-
-    LiveHidingFixture {
-        profile,
-        record,
-        manifest,
-        prefix_events,
-    }
+    LiveHidingFixture { input }
 }
 
-/// Rebuilds a record from `original` replacing the binding at `domain_label`
-/// with `replacement_bytes`. Other bindings are preserved in absorption order.
+// ── Record mutation helpers ──────────────────────────────────────────────────
+
+/// Rebuilds a record from `original` replacing the binding at
+/// `domain_label` with `replacement_bytes`. Other bindings are
+/// preserved in absorption order.
 fn record_with_replaced_binding(
     original: &ReferenceBindingRecord,
     domain_label: &'static str,
@@ -545,7 +262,8 @@ fn record_with_replaced_binding(
     out
 }
 
-/// Rebuilds a record from `original` with the binding at `domain_label` dropped.
+/// Rebuilds a record from `original` with the binding at `domain_label`
+/// dropped.
 fn record_with_dropped_binding(
     original: &ReferenceBindingRecord,
     domain_label: &str,
@@ -561,18 +279,19 @@ fn record_with_dropped_binding(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// **Positive end-to-end invariant.** A live `Plonky3ReplayHarness` tuple
-/// built from real `HidingFriPcs` prove output must verify cleanly. If
-/// this fails, the extractor logic, the binding composition, or the
-/// recorder is broken — every downstream negative test is moot.
+/// **Positive end-to-end invariant.** A live
+/// [`Plonky3LiveHarnessInput`] built from real `HidingFriPcs` prove
+/// output via the production extractor + builder must verify cleanly
+/// through [`Plonky3ReplayHarness`]. If this fails, the production
+/// pipeline is broken — every downstream negative test is moot.
 #[test]
 fn live_harness_verifies_well_formed_inputs() {
     let fixture = build_live_hiding_fixture();
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
-        &fixture.record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.profile,
+        &fixture.input.record,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     harness
         .verify()
@@ -586,14 +305,15 @@ fn live_harness_verifies_well_formed_inputs() {
 
 /// **Cross-protocol confusion (security-model §2).** Replace the
 /// hash-suite identifier binding in the record with a different suite.
-/// The manifest still expects the canonical Plonky3HashIdentifier bytes.
+/// The manifest still expects the canonical Plonky3HashIdentifier
+/// bytes.
 /// → `Manifest(BindingMismatch { DOMAIN_HASH_ID })`.
 #[test]
 fn live_negative_wrong_hash_identifier_rejected() {
     let fixture = build_live_hiding_fixture();
     let wrong_suite = HashIdentifier::new("attacker-controlled-suite");
     let record = record_with_replaced_binding(
-        &fixture.record,
+        &fixture.input.record,
         DOMAIN_HASH_ID,
         wrong_suite
             .to_transcript_binding()
@@ -601,10 +321,10 @@ fn live_negative_wrong_hash_identifier_rejected() {
             .to_vec(),
     );
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
+        &fixture.input.profile,
         &record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     match harness.verify().unwrap_err() {
         HarnessError::Manifest(TranscriptBindingError::BindingMismatch { domain_label }) => {
@@ -616,20 +336,21 @@ fn live_negative_wrong_hash_identifier_rejected() {
 
 /// **Commitment substitution (security-model §2).** Mutate the trace
 /// commitment binding in the record. The manifest expects the live
-/// `trace_commit_bytes`. → `Manifest(BindingMismatch { DOMAIN_PLONKY3_TRACE_COMMITMENT })`.
+/// `trace_commit` bytes.
+/// → `Manifest(BindingMismatch { DOMAIN_PLONKY3_TRACE_COMMITMENT })`.
 #[test]
 fn live_negative_mutated_trace_commitment_rejected() {
     let fixture = build_live_hiding_fixture();
     let record = record_with_replaced_binding(
-        &fixture.record,
+        &fixture.input.record,
         DOMAIN_PLONKY3_TRACE_COMMITMENT,
         vec![0xFF; 32],
     );
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
+        &fixture.input.profile,
         &record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     match harness.verify().unwrap_err() {
         HarnessError::Manifest(TranscriptBindingError::BindingMismatch { domain_label }) => {
@@ -640,21 +361,22 @@ fn live_negative_mutated_trace_commitment_rejected() {
 }
 
 /// **Randomizer substitution (security-model §2, hiding-path-specific).**
-/// Mutate the randomizer commitment binding. → `Manifest(BindingMismatch { DOMAIN_RANDOMIZER_COMMITMENT })`.
+/// Mutate the randomizer commitment binding.
+/// → `Manifest(BindingMismatch { DOMAIN_RANDOMIZER_COMMITMENT })`.
 /// This is the hiding-stack-specific threat the bridge exists to close.
 #[test]
 fn live_negative_mutated_randomizer_commitment_rejected() {
     let fixture = build_live_hiding_fixture();
     let record = record_with_replaced_binding(
-        &fixture.record,
+        &fixture.input.record,
         DOMAIN_RANDOMIZER_COMMITMENT,
         vec![0xEE; 32],
     );
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
+        &fixture.input.profile,
         &record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     match harness.verify().unwrap_err() {
         HarnessError::Manifest(TranscriptBindingError::BindingMismatch { domain_label }) => {
@@ -664,18 +386,20 @@ fn live_negative_mutated_randomizer_commitment_rejected() {
     }
 }
 
-/// **Missing-binding (security-model §1).** Drop the quotient commitment
-/// from the record entirely. The manifest still requires it.
+/// **Missing-binding (security-model §1).** Drop the quotient
+/// commitment from the record entirely. The manifest still requires
+/// it.
 /// → `Manifest(MissingBinding { DOMAIN_PLONKY3_QUOTIENT_COMMITMENT })`.
 #[test]
 fn live_negative_dropped_quotient_commitment_rejected() {
     let fixture = build_live_hiding_fixture();
-    let record = record_with_dropped_binding(&fixture.record, DOMAIN_PLONKY3_QUOTIENT_COMMITMENT);
+    let record =
+        record_with_dropped_binding(&fixture.input.record, DOMAIN_PLONKY3_QUOTIENT_COMMITMENT);
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
+        &fixture.input.profile,
         &record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     match harness.verify().unwrap_err() {
         HarnessError::Manifest(TranscriptBindingError::MissingBinding { domain_label }) => {
@@ -693,6 +417,7 @@ fn live_negative_dropped_quotient_commitment_rejected() {
 fn live_negative_mutated_observation_in_prefix_rejected() {
     let mut fixture = build_live_hiding_fixture();
     let first_observed = fixture
+        .input
         .prefix_events
         .iter_mut()
         .find(|e| matches!(e, ByteTranscriptEvent::Observed(_)))
@@ -701,10 +426,10 @@ fn live_negative_mutated_observation_in_prefix_rejected() {
         bytes[0] ^= 0xFF;
     }
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
-        &fixture.record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.profile,
+        &fixture.input.record,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     let err = harness.verify().unwrap_err();
     assert!(
@@ -720,6 +445,7 @@ fn live_negative_mutated_observation_in_prefix_rejected() {
 fn live_negative_reordered_events_in_prefix_rejected() {
     let mut fixture = build_live_hiding_fixture();
     let (i, j) = fixture
+        .input
         .prefix_events
         .windows(2)
         .enumerate()
@@ -730,12 +456,12 @@ fn live_negative_reordered_events_in_prefix_rejected() {
             _ => None,
         })
         .expect("prefix must contain two adjacent Observed events with different bytes");
-    fixture.prefix_events.swap(i, j);
+    fixture.input.prefix_events.swap(i, j);
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
-        &fixture.record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.profile,
+        &fixture.input.record,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     let err = harness.verify().unwrap_err();
     assert!(
@@ -750,12 +476,12 @@ fn live_negative_reordered_events_in_prefix_rejected() {
 #[test]
 fn live_negative_profile_drift_rejected() {
     let mut fixture = build_live_hiding_fixture();
-    fixture.profile.input_mmcs_hiding = false;
+    fixture.input.profile.input_mmcs_hiding = false;
     let harness = Plonky3ReplayHarness::new(
-        &fixture.profile,
-        &fixture.record,
-        &fixture.manifest,
-        &fixture.prefix_events,
+        &fixture.input.profile,
+        &fixture.input.record,
+        &fixture.input.manifest,
+        &fixture.input.prefix_events,
     );
     let err = harness.verify().unwrap_err();
     assert!(
