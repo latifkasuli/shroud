@@ -64,7 +64,8 @@ pub use live_extractor::{
     longest_byte_equivalent_prefix,
 };
 pub use live_harness::{
-    Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput, build_pre_grind_harness_input,
+    Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput, PreGrindBridgeError,
+    build_pre_grind_harness_input, verify_pre_grind_bridge,
 };
 pub use recording_challenger::{
     ByteRecorder, ByteTranscriptEvent, PinnedByteChallenger, PinnedByteHash,

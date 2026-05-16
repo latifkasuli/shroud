@@ -63,6 +63,7 @@ use shroud_plonky3::{
     LiveExtractorShape, Plonky3HashIdentifier, Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput,
     Plonky3ReplayHarness, RecordingByteChallenger, build_pre_grind_harness_input,
     extract_pre_grind_slices, longest_byte_equivalent_prefix, new_pinned_recording_challenger,
+    verify_pre_grind_bridge,
 };
 use shroud_quotient_hider::{
     QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
@@ -296,6 +297,75 @@ fn live_harness_verifies_well_formed_inputs() {
     harness
         .verify()
         .expect("live harness must verify against real prove output");
+}
+
+/// **Facade positive path.** [`verify_pre_grind_bridge`] is the
+/// stable downstream entry point. Driving it with the raw recorder
+/// event log from a real `HidingFriPcs` prove must succeed — the
+/// facade internally trims, extracts, builds, and verifies in one
+/// call. If this fails, the facade is broken or the underlying
+/// pipeline diverged from what `build_live_hiding_fixture` covers.
+#[test]
+fn live_facade_verifies_well_formed_proof_end_to_end() {
+    let (config, recorder) = make_recording_hiding_config();
+    let trace = generate_square_trace::<Val>(1 << 3);
+    let _proof = prove(&config, &SquareAir, trace, &[]);
+    let events = recorder.events();
+
+    // Build the same SHROUD protocol-spec values + post-zeta
+    // placeholders the in-test fixture uses; the facade does the rest.
+    let hash_identifier = Plonky3HashIdentifier::standard().to_hash_identifier();
+    let profile = shroud_reference::ReferenceHidingFriPcsProfile::standard();
+    let basis = BasisDescriptor::plonky3_binomial(4);
+    let batch_spec =
+        ShroudBatchOpeningSpec::statistical(BatchOpeningShape::new(4, 1, 2).expect("valid"), 15)
+            .expect("valid");
+    let codeword_spec = ShroudCodewordEmbeddingSpec::statistical(
+        CodewordEmbeddingShape::new(64, 4, 18, 4).expect("valid"),
+    )
+    .expect("valid");
+    let oracle_spec = ShroudOracleCommitmentSpec::statistical(
+        OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid"),
+        OracleAuxiliaryTransport::InBandWithOpeningProof,
+    )
+    .expect("valid");
+    let projection_spec = ShroudOpeningProjectionSpec::statistical(
+        OpeningProjectionShape::new(3, 5, 2).expect("valid"),
+        AuxiliaryOpeningTransport::InBandWithMainProof,
+    )
+    .expect("valid");
+    let degree_contract = QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid");
+    let quotient_spec = ShroudQuotientHiderSpec::statistical(
+        QuotientDecompositionFamily::DegreeChunked,
+        8,
+        QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid"),
+        QuotientAuxiliaryTransport::InBandWithOpeningProof,
+        Some(degree_contract),
+    )
+    .expect("valid");
+    let security_level = SecurityLevel::Statistical;
+    let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]);
+
+    let config = Plonky3LiveHarnessConfig {
+        hash_identifier: &hash_identifier,
+        profile: &profile,
+        basis: &basis,
+        batch_spec: &batch_spec,
+        codeword_spec: &codeword_spec,
+        oracle_spec: &oracle_spec,
+        projection_spec: &projection_spec,
+        quotient_spec: &quotient_spec,
+        security_level: &security_level,
+        degree_contract: &degree_contract,
+        public_openings: &public_openings,
+        opened_values: vec![0x00; 8],
+        fri_commit_phase_commitments: vec![0x01; 8],
+        fri_final_poly: vec![0x02; 8],
+        fri_log_arities: vec![0x03; 8],
+    };
+
+    verify_pre_grind_bridge(&events, &LiveExtractorShape::standard(), &config)
+        .expect("facade must verify a well-formed live proof end-to-end");
 }
 
 // ── Negative battery ─────────────────────────────────────────────────────────

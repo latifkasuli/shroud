@@ -50,9 +50,15 @@ use shroud_oracle_commitment::ShroudOracleCommitmentSpec;
 use shroud_quotient_hider::{QuotientDegreeContract, ShroudQuotientHiderSpec};
 use shroud_reference::{ReferenceBindingRecord, ReferenceHidingFriPcsProfile};
 
+use core::fmt;
+
 use crate::extended_bindings::Plonky3UniStarkBindings;
-use crate::live_extractor::LivePreGrindExtraction;
+use crate::live_extractor::{
+    LiveExtractionError, LiveExtractorShape, LivePreGrindExtraction, extract_pre_grind_slices,
+    longest_byte_equivalent_prefix,
+};
 use crate::recording_challenger::ByteTranscriptEvent;
+use crate::replay_harness::{HarnessError, Plonky3ReplayHarness};
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
@@ -268,6 +274,111 @@ pub fn build_pre_grind_harness_input(
         manifest,
         prefix_events,
     }
+}
+
+// ── Facade ───────────────────────────────────────────────────────────────────
+
+/// Combined error reported by [`verify_pre_grind_bridge`]. Flattens
+/// the two failure surfaces a downstream caller would otherwise have
+/// to handle separately:
+///
+/// - [`Self::Extraction`] — the structural walker rejected the live
+///   recorder events (truncated log, sampled-inside-observe-block,
+///   overshoot, missing challenge sample). The recorder did not
+///   produce a SHROUD-stage-shaped prefix; the bridge cannot proceed.
+/// - [`Self::Harness`] — the harness invariants failed against the
+///   composed bindings (provenance gate, manifest exact-presence,
+///   byte-equivalence replay). Carries the [`HarnessError`] for
+///   programmatic dispatch.
+#[derive(Debug)]
+pub enum PreGrindBridgeError {
+    /// The live extractor rejected the recorder events.
+    Extraction(LiveExtractionError),
+    /// The replay harness rejected the composed bindings.
+    Harness(HarnessError),
+}
+
+impl fmt::Display for PreGrindBridgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Extraction(e) => write!(f, "[pre_grind_bridge] {e}"),
+            Self::Harness(e) => write!(f, "[pre_grind_bridge] {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PreGrindBridgeError {}
+
+impl From<LiveExtractionError> for PreGrindBridgeError {
+    fn from(e: LiveExtractionError) -> Self {
+        Self::Extraction(e)
+    }
+}
+
+impl From<HarnessError> for PreGrindBridgeError {
+    fn from(e: HarnessError) -> Self {
+        Self::Harness(e)
+    }
+}
+
+/// End-to-end pre-grind bridge verifier — the stable public entry
+/// point for downstream callers.
+///
+/// Given the raw recorder event log from a live `HidingFriPcs`
+/// prove invocation, the deployment's [`LiveExtractorShape`], and a
+/// [`Plonky3LiveHarnessConfig`] carrying the SHROUD protocol-spec
+/// bindings + post-zeta placeholders, this function:
+///
+/// 1. trims the events to the longest replay-clean prefix via
+///    [`longest_byte_equivalent_prefix`] (grind clone-pollution
+///    workaround);
+/// 2. extracts the named SHROUD-stage byte slices via
+///    [`extract_pre_grind_slices`];
+/// 3. composes the harness input via
+///    [`build_pre_grind_harness_input`];
+/// 4. verifies the three [`Plonky3ReplayHarness`] invariants
+///    (provenance → manifest → byte-equivalence replay).
+///
+/// All four steps run fail-fast; the first failing layer determines
+/// the returned [`PreGrindBridgeError`] variant.
+///
+/// # Scope
+///
+/// See `docs/plonky3-bridge-status.md` for the frozen list of what is
+/// supported / placeholder / deferred. The facade does NOT cover
+/// post-grind PCS-internal events (opened values, FRI commit phase,
+/// final poly, log arities).
+///
+/// # Example
+///
+/// ```ignore
+/// use shroud_plonky3::{
+///     verify_pre_grind_bridge, LiveExtractorShape, Plonky3LiveHarnessConfig,
+/// };
+///
+/// let events = recorder.events();
+/// verify_pre_grind_bridge(&events, &LiveExtractorShape::standard(), &config)?;
+/// ```
+pub fn verify_pre_grind_bridge(
+    events: &[ByteTranscriptEvent],
+    shape: &LiveExtractorShape,
+    config: &Plonky3LiveHarnessConfig<'_>,
+) -> Result<(), PreGrindBridgeError> {
+    let longest = longest_byte_equivalent_prefix(events);
+    let prefix_events: Vec<ByteTranscriptEvent> = events[..longest].to_vec();
+
+    let extraction = extract_pre_grind_slices(&prefix_events, shape)?;
+    let input = build_pre_grind_harness_input(&extraction, prefix_events, config);
+
+    Plonky3ReplayHarness::new(
+        &input.profile,
+        &input.record,
+        &input.manifest,
+        &input.prefix_events,
+    )
+    .verify()?;
+
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -488,5 +599,82 @@ mod tests {
                  for DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT",
             );
         assert_eq!(pp_binding.canonical_bytes(), &[0x77u8; 32][..]);
+    }
+
+    // ── Facade error-flattening ──────────────────────────────────────────────
+
+    /// The facade must surface a `LiveExtractionError` as the
+    /// `Extraction` variant of `PreGrindBridgeError`. We use an
+    /// obviously-malformed (empty) event log: the extractor's first
+    /// call fails with `TruncatedLog { reading: "log_ext_degree" }`,
+    /// and the facade must wrap-and-return that without ever
+    /// reaching the harness layer.
+    #[test]
+    fn facade_surfaces_extraction_error_for_empty_events() {
+        let hash_identifier = Plonky3HashIdentifier::standard().to_hash_identifier();
+        let profile = ReferenceHidingFriPcsProfile::standard();
+        let basis = BasisDescriptor::plonky3_binomial(4);
+        let batch_spec = ShroudBatchOpeningSpec::statistical(
+            BatchOpeningShape::new(4, 1, 2).expect("valid"),
+            15,
+        )
+        .expect("valid");
+        let codeword_spec = ShroudCodewordEmbeddingSpec::statistical(
+            CodewordEmbeddingShape::new(64, 4, 18, 4).expect("valid"),
+        )
+        .expect("valid");
+        let oracle_spec = ShroudOracleCommitmentSpec::statistical(
+            OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid"),
+            OracleAuxiliaryTransport::InBandWithOpeningProof,
+        )
+        .expect("valid");
+        let projection_spec = ShroudOpeningProjectionSpec::statistical(
+            OpeningProjectionShape::new(3, 5, 2).expect("valid"),
+            AuxiliaryOpeningTransport::InBandWithMainProof,
+        )
+        .expect("valid");
+        let degree_contract =
+            QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid");
+        let quotient_spec = ShroudQuotientHiderSpec::statistical(
+            QuotientDecompositionFamily::DegreeChunked,
+            8,
+            QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid"),
+            QuotientAuxiliaryTransport::InBandWithOpeningProof,
+            Some(degree_contract),
+        )
+        .expect("valid");
+        let security_level = SecurityLevel::Statistical;
+        let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]);
+
+        let config = Plonky3LiveHarnessConfig {
+            hash_identifier: &hash_identifier,
+            profile: &profile,
+            basis: &basis,
+            batch_spec: &batch_spec,
+            codeword_spec: &codeword_spec,
+            oracle_spec: &oracle_spec,
+            projection_spec: &projection_spec,
+            quotient_spec: &quotient_spec,
+            security_level: &security_level,
+            degree_contract: &degree_contract,
+            public_openings: &public_openings,
+            opened_values: vec![0x00; 8],
+            fri_commit_phase_commitments: vec![0x01; 8],
+            fri_final_poly: vec![0x02; 8],
+            fri_log_arities: vec![0x03; 8],
+        };
+
+        let err =
+            verify_pre_grind_bridge(&[], &LiveExtractorShape::standard(), &config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PreGrindBridgeError::Extraction(LiveExtractionError::TruncatedLog {
+                    reading: "log_ext_degree",
+                    ..
+                })
+            ),
+            "expected Extraction(TruncatedLog(log_ext_degree)), got {err:?}"
+        );
     }
 }

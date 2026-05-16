@@ -7,6 +7,7 @@ Read them after the protocol notes. They are backend-specific mappings, not part
 ## Current Backend Notes
 
 - [Plonky3 Mapping](Plonky3%20Mapping.md)
+- [Plonky3 Bridge Status](plonky3-bridge-status.md)
 - [Adapter Composition Criteria](Adapter%20Composition%20Criteria.md)
 - [Stwo Mapping](Stwo%20Mapping.md)
 - [Stwo Compatibility Memo](Stwo%20Compatibility%20Memo.md)
