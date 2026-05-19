@@ -1,14 +1,19 @@
-# SHROUD Backend Notes
+# SHROUD Notes
 
 These notes are downstream of the core SHROUD packet in [../../research/shroud/README.md](/Users/latifkasuli/web3/contributions/research/shroud/README.md).
 
-Read them after the protocol notes. They are backend-specific mappings, not part of the protocol definition itself.
+Read them after the protocol notes. Architecture notes explain how SHROUD should be organized; backend notes show how the same SHROUD objects land in specific systems.
+
+## Architecture Notes
+
+- [Lean Normative Spec Restructure](Lean%20Normative%20Spec%20Restructure.md)
+- [Adapter Composition Criteria](Adapter%20Composition%20Criteria.md)
 
 ## Current Backend Notes
 
 - [Plonky3 Mapping](Plonky3%20Mapping.md)
 - [Plonky3 Bridge Status](plonky3-bridge-status.md)
-- [Adapter Composition Criteria](Adapter%20Composition%20Criteria.md)
+- [HVZK-WHIR Impact on SHROUD](HVZK-WHIR%20Impact%20on%20SHROUD.md)
 - [Stwo Mapping](Stwo%20Mapping.md)
 - [Stwo Compatibility Memo](Stwo%20Compatibility%20Memo.md)
 - [Winterfell Mapping](Winterfell%20Mapping.md)

@@ -1,4 +1,5 @@
 /target/
+/.lake/
 
 # Local editor and OS metadata.
 .DS_Store
