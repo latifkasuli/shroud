@@ -613,7 +613,9 @@ mod tests {
         RandomizerOpeningPayload, ShroudBatchOpeningSpec,
     };
     use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
-    use shroud_core::SecurityLevel;
+    use shroud_core::{
+        FieldModel, PerfectClaim, RandomnessModel, SecurityLevel, SimulatorObligations,
+    };
     use shroud_opening_projection::{
         AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
     };
@@ -624,6 +626,17 @@ mod tests {
         QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
         QuotientHiderShape, ShroudQuotientHiderSpec,
     };
+
+    fn valid_native_perfect_claim(extension_degree: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::NativeExtension { extension_degree },
+            64,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid native perfect claim")
+    }
 
     #[test]
     fn codeword_embedding_plan_tracks_committed_columns_and_blowup() {
@@ -691,6 +704,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim(2),
         )
         .expect("valid spec");
 

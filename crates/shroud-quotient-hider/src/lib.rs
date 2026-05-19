@@ -14,8 +14,8 @@
 use core::fmt;
 
 use shroud_core::{
-    DOMAIN_DEGREE_CONTRACT, DOMAIN_QUOTIENT_HIDER, SecurityLevel, TranscriptBindable,
-    TranscriptBinding,
+    DOMAIN_DEGREE_CONTRACT, DOMAIN_QUOTIENT_HIDER, PerfectClaim, PerfectClaimError, SecurityLevel,
+    TranscriptBindable, TranscriptBinding,
 };
 
 /// Quotient decomposition family supported by the hiding transform.
@@ -114,7 +114,14 @@ impl QuotientDegreeContract {
         mask_poly_degree: usize,
         randomized_chunk_degree_bound: usize,
     ) -> Result<Self, QuotientHiderError> {
-        let combined = vanishing_poly_degree.saturating_add(mask_poly_degree);
+        let combined = vanishing_poly_degree.checked_add(mask_poly_degree).ok_or(
+            QuotientHiderError::DegreeContractOverflow {
+                quotient_chunk_degree,
+                vanishing_poly_degree,
+                mask_poly_degree,
+                randomized_chunk_degree_bound,
+            },
+        )?;
         let required = quotient_chunk_degree.max(combined);
         if required > randomized_chunk_degree_bound {
             return Err(QuotientHiderError::DegreeContractViolation {
@@ -247,6 +254,21 @@ impl QuotientHiderShape {
         if hidden_normalization_items == 0 {
             return Err(QuotientHiderError::ZeroHiddenNormalizationItems);
         }
+        if opening_points.checked_mul(openings_per_point).is_none() {
+            return Err(QuotientHiderError::PublicOpeningValuesOverflow {
+                opening_points,
+                openings_per_point,
+            });
+        }
+        if opening_points
+            .checked_mul(hidden_mask_values_per_point)
+            .is_none()
+        {
+            return Err(QuotientHiderError::HiddenMaskValuesOverflow {
+                opening_points,
+                hidden_mask_values_per_point,
+            });
+        }
 
         Ok(Self {
             decomposition_components,
@@ -307,12 +329,8 @@ impl QuotientHiderPayload {
     ) -> Self {
         Self {
             public_commitments: shape.decomposition_components(),
-            public_opening_values: shape
-                .opening_points()
-                .saturating_mul(shape.openings_per_point()),
-            hidden_mask_values: shape
-                .opening_points()
-                .saturating_mul(shape.hidden_mask_values_per_point()),
+            public_opening_values: shape.opening_points() * shape.openings_per_point(),
+            hidden_mask_values: shape.opening_points() * shape.hidden_mask_values_per_point(),
             hidden_normalization_items: shape.hidden_normalization_items(),
             auxiliary_transport,
         }
@@ -353,6 +371,7 @@ impl QuotientHiderPayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShroudQuotientHiderSpec {
     security_level: SecurityLevel,
+    perfect_claim: Option<PerfectClaim>,
     decomposition_family: QuotientDecompositionFamily,
     query_budget: usize,
     shape: QuotientHiderShape,
@@ -371,6 +390,7 @@ impl ShroudQuotientHiderSpec {
     ) -> Result<Self, QuotientHiderError> {
         Self::new(
             SecurityLevel::Statistical,
+            None,
             decomposition_family,
             query_budget,
             shape,
@@ -386,9 +406,11 @@ impl ShroudQuotientHiderSpec {
         shape: QuotientHiderShape,
         auxiliary_transport: QuotientAuxiliaryTransport,
         degree_contract: Option<QuotientDegreeContract>,
+        perfect_claim: PerfectClaim,
     ) -> Result<Self, QuotientHiderError> {
         Self::new(
             SecurityLevel::Perfect,
+            Some(perfect_claim),
             decomposition_family,
             query_budget,
             shape,
@@ -400,6 +422,7 @@ impl ShroudQuotientHiderSpec {
     /// Builds a quotient-hider object with an explicit security level.
     pub fn new(
         security_level: SecurityLevel,
+        perfect_claim: Option<PerfectClaim>,
         decomposition_family: QuotientDecompositionFamily,
         query_budget: usize,
         shape: QuotientHiderShape,
@@ -409,6 +432,7 @@ impl ShroudQuotientHiderSpec {
         let payload = QuotientHiderPayload::new(shape, auxiliary_transport);
         let spec = Self {
             security_level,
+            perfect_claim,
             decomposition_family,
             query_budget,
             shape,
@@ -423,6 +447,12 @@ impl ShroudQuotientHiderSpec {
     #[must_use]
     pub const fn security_level(&self) -> SecurityLevel {
         self.security_level
+    }
+
+    /// Structured justification for a perfect HVZK claim, if this is a perfect variant.
+    #[must_use]
+    pub const fn perfect_claim(&self) -> Option<PerfectClaim> {
+        self.perfect_claim
     }
 
     /// Quotient decomposition family supported by the object.
@@ -466,6 +496,26 @@ impl ShroudQuotientHiderSpec {
 
     /// Validates the shape-level, decomposition-level, and degree-contract invariants.
     pub fn validate(&self) -> Result<(), QuotientHiderError> {
+        match (self.security_level, self.perfect_claim) {
+            (SecurityLevel::Perfect, None) => {
+                return Err(QuotientHiderError::PerfectRequiresClaim);
+            }
+            (SecurityLevel::Statistical, Some(_)) => {
+                return Err(QuotientHiderError::PerfectClaimOnStatisticalSpec);
+            }
+            (_, _) => {}
+        }
+
+        if let Some(claim) = self.perfect_claim {
+            claim.validate()?;
+            if claim.query_budget < self.query_budget {
+                return Err(QuotientHiderError::PerfectClaimQueryBudgetTooSmall {
+                    claim_query_budget: claim.query_budget,
+                    required_query_budget: self.query_budget,
+                });
+            }
+        }
+
         if self.query_budget == 0 {
             return Err(QuotientHiderError::ZeroQueryBudget);
         }
@@ -497,15 +547,9 @@ impl ShroudQuotientHiderSpec {
 
         if self.payload.public_commitments() != self.shape.decomposition_components()
             || self.payload.public_opening_values()
-                != self
-                    .shape
-                    .opening_points()
-                    .saturating_mul(self.shape.openings_per_point())
+                != self.shape.opening_points() * self.shape.openings_per_point()
             || self.payload.hidden_mask_values()
-                != self
-                    .shape
-                    .opening_points()
-                    .saturating_mul(self.shape.hidden_mask_values_per_point())
+                != self.shape.opening_points() * self.shape.hidden_mask_values_per_point()
             || self.payload.hidden_normalization_items() != self.shape.hidden_normalization_items()
         {
             return Err(QuotientHiderError::PayloadShapeMismatch);
@@ -522,6 +566,13 @@ impl TranscriptBindable for ShroudQuotientHiderSpec {
     fn to_transcript_binding(&self) -> TranscriptBinding {
         let mut bytes = Vec::new();
         bytes.push(security_level_discriminant(self.security_level()));
+        match self.perfect_claim() {
+            Some(claim) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&claim.to_canonical_bytes());
+            }
+            None => bytes.push(0),
+        }
         bytes.push(decomposition_family_discriminant(
             self.decomposition_family(),
         ));
@@ -584,8 +635,41 @@ pub enum QuotientHiderError {
     ZeroHiddenMaskValuesPerPoint,
     /// A quotient-hider object must carry at least one hidden normalization item.
     ZeroHiddenNormalizationItems,
+    /// The public opening value count `opening_points * openings_per_point` overflowed `usize`.
+    ///
+    /// SHROUD's normative Lean model uses exact natural-number multiplication
+    /// for payload accounting. Rust must reject shapes whose exact count cannot
+    /// be represented by `usize`.
+    PublicOpeningValuesOverflow {
+        /// Number of queried opening points.
+        opening_points: usize,
+        /// Number of public quotient openings per point.
+        openings_per_point: usize,
+    },
+    /// The hidden mask value count `opening_points * hidden_mask_values_per_point` overflowed `usize`.
+    ///
+    /// This mirrors Lean's exact quotient-hider payload law.
+    HiddenMaskValuesOverflow {
+        /// Number of queried opening points.
+        opening_points: usize,
+        /// Number of hidden mask values per point.
+        hidden_mask_values_per_point: usize,
+    },
     /// The query budget must be at least one.
     ZeroQueryBudget,
+    /// Perfect variants must carry a structured `PerfectClaim`.
+    PerfectRequiresClaim,
+    /// Statistical variants must not carry perfect-claim evidence.
+    PerfectClaimOnStatisticalSpec,
+    /// The supplied `PerfectClaim` is internally inconsistent.
+    PerfectClaim(PerfectClaimError),
+    /// The perfect claim query budget does not cover the quotient-hider query budget.
+    PerfectClaimQueryBudgetTooSmall {
+        /// Query budget declared by the perfect claim.
+        claim_query_budget: usize,
+        /// Query budget required by the object surface.
+        required_query_budget: usize,
+    },
     /// A monolithic decomposition must expose exactly one quotient component.
     MonolithicRequiresSingleComponent {
         /// Number of components actually supplied.
@@ -622,6 +706,22 @@ pub enum QuotientHiderError {
         /// Actual required committed degree: `max(quotient_chunk_degree, vanishing_poly_degree + mask_poly_degree)`.
         required_degree: usize,
     },
+    /// The vanishing-factor degree sum overflowed `usize`.
+    ///
+    /// SHROUD's normative Lean model uses exact natural-number addition for
+    /// `vanishing_poly_degree + mask_poly_degree`. If that sum cannot be
+    /// represented by Rust's `usize`, the finite implementation must reject the
+    /// contract instead of saturating and accepting a mathematically invalid bound.
+    DegreeContractOverflow {
+        /// Degree of `q_i(X)` before masking.
+        quotient_chunk_degree: usize,
+        /// Degree of the vanishing polynomial factor.
+        vanishing_poly_degree: usize,
+        /// Degree of the mask polynomial.
+        mask_poly_degree: usize,
+        /// Caller-supplied committed degree bound.
+        randomized_chunk_degree_bound: usize,
+    },
 }
 
 impl fmt::Display for QuotientHiderError {
@@ -646,7 +746,41 @@ impl fmt::Display for QuotientHiderError {
                 f,
                 "quotient hider must carry at least one hidden normalization item"
             ),
+            Self::PublicOpeningValuesOverflow {
+                opening_points,
+                openings_per_point,
+            } => write!(
+                f,
+                "quotient hider public opening value count overflows usize: \
+                 opening_points ({opening_points}) * openings_per_point ({openings_per_point})"
+            ),
+            Self::HiddenMaskValuesOverflow {
+                opening_points,
+                hidden_mask_values_per_point,
+            } => write!(
+                f,
+                "quotient hider hidden mask value count overflows usize: \
+                 opening_points ({opening_points}) * hidden_mask_values_per_point \
+                 ({hidden_mask_values_per_point})"
+            ),
             Self::ZeroQueryBudget => write!(f, "quotient hider query budget must be at least one"),
+            Self::PerfectRequiresClaim => write!(
+                f,
+                "perfect quotient-hider specs must carry a validated PerfectClaim"
+            ),
+            Self::PerfectClaimOnStatisticalSpec => write!(
+                f,
+                "statistical quotient-hider specs must not carry a PerfectClaim"
+            ),
+            Self::PerfectClaim(err) => err.fmt(f),
+            Self::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget,
+                required_query_budget,
+            } => write!(
+                f,
+                "perfect quotient-hider claim query budget ({claim_query_budget}) does not cover \
+                 the required quotient query budget ({required_query_budget})"
+            ),
             Self::MonolithicRequiresSingleComponent { observed } => write!(
                 f,
                 "monolithic quotient decomposition requires exactly one component, observed {observed}"
@@ -684,11 +818,29 @@ impl fmt::Display for QuotientHiderError {
                      to hold max(deg(q_i), deg(v_H_i) + deg(t_i))"
                 )
             }
+            Self::DegreeContractOverflow {
+                quotient_chunk_degree,
+                vanishing_poly_degree,
+                mask_poly_degree,
+                randomized_chunk_degree_bound,
+            } => write!(
+                f,
+                "vanishing-factor degree sum overflowed usize: quotient {quotient_chunk_degree}, \
+                 vanishing({vanishing_poly_degree}) + mask({mask_poly_degree}) cannot be \
+                 represented, so randomized_chunk_degree_bound {randomized_chunk_degree_bound} \
+                 cannot satisfy the exact SHROUD degree contract"
+            ),
         }
     }
 }
 
 impl std::error::Error for QuotientHiderError {}
+
+impl From<PerfectClaimError> for QuotientHiderError {
+    fn from(value: PerfectClaimError) -> Self {
+        Self::PerfectClaim(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -696,7 +848,23 @@ mod tests {
         QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
         QuotientHiderError, QuotientHiderShape, ShroudQuotientHiderSpec,
     };
-    use shroud_core::{SecurityLevel, TranscriptBindable};
+    use shroud_core::{
+        BasisDescriptor, FieldModel, PerfectClaim, RandomnessModel, SecurityLevel,
+        SimulatorObligations, TranscriptBindable,
+    };
+
+    fn valid_perfect_claim(extension_degree: usize, query_budget: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::EncodedCoordinates {
+                basis: BasisDescriptor::plonky3_binomial(extension_degree),
+            },
+            query_budget,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid perfect claim")
+    }
 
     fn chunked_shape() -> QuotientHiderShape {
         QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid shape")
@@ -739,6 +907,7 @@ mod tests {
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
             None,
+            valid_perfect_claim(2, 6),
         )
         .expect("valid spec");
 
@@ -747,7 +916,83 @@ mod tests {
             spec.auxiliary_transport(),
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof
         );
+        assert!(spec.perfect_claim().is_some());
         assert_eq!(spec.payload().hidden_mask_values(), 6);
+    }
+
+    #[test]
+    fn generic_constructor_rejects_perfect_without_claim() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        assert_eq!(
+            ShroudQuotientHiderSpec::new(
+                SecurityLevel::Perfect,
+                None,
+                QuotientDecompositionFamily::Segmented,
+                6,
+                shape,
+                QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+                None,
+            ),
+            Err(QuotientHiderError::PerfectRequiresClaim)
+        );
+    }
+
+    #[test]
+    fn generic_constructor_rejects_claim_on_statistical_spec() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        assert_eq!(
+            ShroudQuotientHiderSpec::new(
+                SecurityLevel::Statistical,
+                Some(valid_perfect_claim(2, 6)),
+                QuotientDecompositionFamily::Segmented,
+                6,
+                shape,
+                QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+                None,
+            ),
+            Err(QuotientHiderError::PerfectClaimOnStatisticalSpec)
+        );
+    }
+
+    #[test]
+    fn perfect_claim_query_budget_must_cover_quotient_query_budget() {
+        let shape = QuotientHiderShape::new(2, 3, 2, 2, 4).expect("valid shape");
+        assert_eq!(
+            ShroudQuotientHiderSpec::perfect(
+                QuotientDecompositionFamily::Segmented,
+                6,
+                shape,
+                QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
+                None,
+                valid_perfect_claim(2, 5),
+            ),
+            Err(QuotientHiderError::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget: 5,
+                required_query_budget: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_public_opening_values_overflow() {
+        assert_eq!(
+            QuotientHiderShape::new(1, usize::MAX, 2, 1, 1),
+            Err(QuotientHiderError::PublicOpeningValuesOverflow {
+                opening_points: usize::MAX,
+                openings_per_point: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_hidden_mask_values_overflow() {
+        assert_eq!(
+            QuotientHiderShape::new(1, usize::MAX, 1, 2, 1),
+            Err(QuotientHiderError::HiddenMaskValuesOverflow {
+                opening_points: usize::MAX,
+                hidden_mask_values_per_point: 2,
+            })
+        );
     }
 
     #[test]
@@ -847,6 +1092,19 @@ mod tests {
                 mask_poly_degree: 6,
                 randomized_chunk_degree_bound: 15,
                 required_degree: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn degree_contract_with_vanishing_poly_rejects_overflow() {
+        assert_eq!(
+            QuotientDegreeContract::with_vanishing_poly(15, usize::MAX, 1, usize::MAX),
+            Err(QuotientHiderError::DegreeContractOverflow {
+                quotient_chunk_degree: 15,
+                vanishing_poly_degree: usize::MAX,
+                mask_poly_degree: 1,
+                randomized_chunk_degree_bound: usize::MAX,
             })
         );
     }

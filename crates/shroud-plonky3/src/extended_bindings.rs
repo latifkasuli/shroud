@@ -299,7 +299,8 @@ impl Plonky3UniStarkBindings {
         self,
         standard: StandardBatchOpeningBindings,
     ) -> TranscriptBindingManifest {
-        let mut manifest = TranscriptBindingManifest::standard_for_batch_opening(standard);
+        let mut manifest =
+            TranscriptBindingManifest::standard_for_batch_opening(standard).into_inner();
 
         // Before SampleBatchingChallenge: events 1–6
         manifest = manifest
@@ -330,23 +331,25 @@ impl Plonky3UniStarkBindings {
     /// Absorbs every Plonky3 event binding into the record in event-map order.
     ///
     /// Order: 1, 2, 3, 4, 5 *(if present)*, 6, 8, 12, 14, 17, 18. This is the
-    /// time-order in which the events fire on the Plonky3 prove path. Use
-    /// this on the prover side to build a [`ReferenceBindingRecord`] whose
-    /// absorption sequence mirrors the actual Plonky3 challenger transcript.
+    /// time-order in which the events fire on the Plonky3 prove path.
+    ///
+    /// Source annotations follow the current production bridge boundary:
+    /// pre-zeta slots are live recorder bytes, while post-zeta opened values
+    /// and FRI slots are placeholders until post-zeta extraction lands.
     pub fn absorb_into(&self, record: &mut ReferenceBindingRecord) {
-        record.absorb(self.log_ext_degree.clone());
-        record.absorb(self.log_degree.clone());
-        record.absorb(self.preprocessed_width.clone());
-        record.absorb(self.trace_commitment.clone());
+        record.absorb_live(self.log_ext_degree.clone());
+        record.absorb_live(self.log_degree.clone());
+        record.absorb_live(self.preprocessed_width.clone());
+        record.absorb_live(self.trace_commitment.clone());
         if let Some(pre) = &self.preprocessed_commitment {
-            record.absorb(pre.clone());
+            record.absorb_live(pre.clone());
         }
-        record.absorb(self.air_public_values.clone());
-        record.absorb(self.quotient_commitment.clone());
-        record.absorb(self.opened_values.clone());
-        record.absorb(self.fri_commit_phase_commitments.clone());
-        record.absorb(self.fri_final_poly.clone());
-        record.absorb(self.fri_log_arities.clone());
+        record.absorb_live(self.air_public_values.clone());
+        record.absorb_live(self.quotient_commitment.clone());
+        record.absorb_placeholder(self.opened_values.clone());
+        record.absorb_placeholder(self.fri_commit_phase_commitments.clone());
+        record.absorb_placeholder(self.fri_final_poly.clone());
+        record.absorb_placeholder(self.fri_log_arities.clone());
     }
 }
 
@@ -357,7 +360,7 @@ mod tests {
     use super::*;
     use shroud_core::{
         DOMAIN_RANDOMIZER_COMMITMENT, HashIdentifier, SecurityLevel, TranscriptBindable,
-        TranscriptStage,
+        TranscriptBindingSource, TranscriptStage,
     };
 
     /// Test-only wrapper that lifts a raw [`TranscriptBinding`] into something
@@ -801,6 +804,26 @@ mod tests {
                 DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS,
                 DOMAIN_PLONKY3_FRI_FINAL_POLY,
                 DOMAIN_PLONKY3_FRI_LOG_ARITIES,
+            ]
+        );
+
+        let sources: Vec<_> = (0..record.absorbed().len())
+            .map(|index| record.source_at(index))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Live,
+                TranscriptBindingSource::Placeholder,
+                TranscriptBindingSource::Placeholder,
+                TranscriptBindingSource::Placeholder,
+                TranscriptBindingSource::Placeholder,
             ]
         );
     }

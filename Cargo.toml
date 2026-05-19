@@ -4,6 +4,7 @@ members = [
     "crates/shroud-adapter",
     "crates/shroud-batch-opening",
     "crates/shroud-codeword-embedding",
+    "crates/shroud-conformance",
     "crates/shroud-opening-projection",
     "crates/shroud-oracle-commitment",
     "crates/shroud-plonky3",

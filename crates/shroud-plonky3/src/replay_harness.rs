@@ -43,7 +43,10 @@
 
 use core::fmt;
 
-use shroud_core::{TranscriptBindingError, TranscriptBindingManifest};
+use shroud_core::{
+    DOMAIN_PUBLIC_OPENINGS, DOMAIN_RANDOMIZER_COMMITMENT, TranscriptBindingError,
+    TranscriptBindingManifest, TranscriptBindingSource, TranscriptStage,
+};
 use shroud_reference::{ReferenceBindingRecord, ReferenceHidingFriPcsProfile};
 
 use crate::{
@@ -179,6 +182,22 @@ impl<'a> Plonky3ReplayHarness<'a> {
         Ok(())
     }
 
+    /// Runs the harness plus the full-live source gate.
+    ///
+    /// This is stricter than [`Self::verify`]: in addition to provenance,
+    /// manifest, and byte-replay checks, it rejects any binding in the record
+    /// marked as [`shroud_core::TranscriptBindingSource::Placeholder`]. Use this
+    /// once a bridge supplies every manifest-covered backend slot from live
+    /// transcript extraction instead of deferred/planning bytes.
+    pub fn verify_full_live(&self) -> Result<(), HarnessError> {
+        self.verify_provenance()?;
+        self.verify_manifest()?;
+        self.verify_no_placeholder_bindings()?;
+        self.verify_live_backend_sources()?;
+        self.verify_byte_equivalence()?;
+        Ok(())
+    }
+
     /// Invariant 1 only — pinned-backend constants + `p3-symmetric`
     /// advisory gate.
     pub fn verify_provenance(&self) -> Result<(), HarnessError> {
@@ -192,12 +211,56 @@ impl<'a> Plonky3ReplayHarness<'a> {
         Ok(())
     }
 
+    /// Invariant 2b only — reject deferred/planning placeholders.
+    pub fn verify_no_placeholder_bindings(&self) -> Result<(), HarnessError> {
+        self.record.assert_no_placeholder_bindings()?;
+        Ok(())
+    }
+
+    /// Invariant 2c only — require live provenance for backend transcript slots.
+    pub fn verify_live_backend_sources(&self) -> Result<(), HarnessError> {
+        for stage in [
+            TranscriptStage::SampleBatchingChallenge,
+            TranscriptStage::SampleOodPoint,
+            TranscriptStage::ProveMaskedRelation,
+        ] {
+            for binding in self.manifest.required_before(stage) {
+                if requires_live_backend_source(binding.domain_label()) {
+                    self.record.assert_exact_present_from_source(
+                        core::slice::from_ref(binding),
+                        TranscriptBindingSource::Live,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Invariant 3 only — byte-faithful event-log replay through a fresh
     /// Plonky3 challenger.
     pub fn verify_byte_equivalence(&self) -> Result<(), HarnessError> {
         verify_byte_equivalence(self.events)?;
         Ok(())
     }
+}
+
+fn requires_live_backend_source(domain_label: &str) -> bool {
+    matches!(
+        domain_label,
+        DOMAIN_RANDOMIZER_COMMITMENT
+            | DOMAIN_PUBLIC_OPENINGS
+            | crate::DOMAIN_PLONKY3_LOG_EXT_DEGREE
+            | crate::DOMAIN_PLONKY3_LOG_DEGREE
+            | crate::DOMAIN_PLONKY3_PREPROCESSED_WIDTH
+            | crate::DOMAIN_PLONKY3_TRACE_COMMITMENT
+            | crate::DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT
+            | crate::DOMAIN_PLONKY3_AIR_PUBLIC_VALUES
+            | crate::DOMAIN_PLONKY3_QUOTIENT_COMMITMENT
+            | crate::DOMAIN_PLONKY3_OPENED_VALUES
+            | crate::DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS
+            | crate::DOMAIN_PLONKY3_FRI_FINAL_POLY
+            | crate::DOMAIN_PLONKY3_FRI_LOG_ARITIES
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -427,10 +490,23 @@ mod tests {
         record.absorb_bindable(&quotient_spec);
         record.absorb_bindable(&SecurityLevel::Statistical);
         record.absorb_bindable(&degree_contract);
-        record.absorb_bindable(&randomizer);
-        record.absorb_bindable(&public_openings);
+        record.absorb_bindable_with_source(&randomizer, TranscriptBindingSource::Live);
+        record.absorb_bindable_with_source(&public_openings, TranscriptBindingSource::Live);
         // Plonky3-specific bindings (the ones the manifest expects added on top).
-        bindings_for_record.absorb_into(&mut record);
+        // This synthetic fixture drives a full event log, so post-zeta slots are
+        // explicitly live here. The public `Plonky3UniStarkBindings::absorb_into`
+        // helper uses the production pre-grind boundary and marks those slots as
+        // placeholders instead.
+        record.absorb_live(bindings_for_record.log_ext_degree().clone());
+        record.absorb_live(bindings_for_record.log_degree().clone());
+        record.absorb_live(bindings_for_record.preprocessed_width().clone());
+        record.absorb_live(bindings_for_record.trace_commitment().clone());
+        record.absorb_live(bindings_for_record.air_public_values().clone());
+        record.absorb_live(bindings_for_record.quotient_commitment().clone());
+        record.absorb_live(bindings_for_record.opened_values().clone());
+        record.absorb_live(bindings_for_record.fri_commit_phase_commitments().clone());
+        record.absorb_live(bindings_for_record.fri_final_poly().clone());
+        record.absorb_live(bindings_for_record.fri_log_arities().clone());
 
         HarnessFixture {
             profile,
@@ -456,6 +532,71 @@ mod tests {
             &fixture.events,
         );
         harness.verify().expect("well-formed harness must verify");
+        harness
+            .verify_full_live()
+            .expect("placeholder-free harness must pass full-live gate");
+    }
+
+    #[test]
+    fn full_live_verifier_rejects_placeholder_binding_sources() {
+        let fixture = build_fixture();
+        let mut record = ReferenceBindingRecord::new();
+        let first_binding = fixture
+            .record
+            .absorbed()
+            .first()
+            .expect("fixture absorbs at least one binding");
+
+        for (index, binding) in fixture.record.absorbed().iter().enumerate() {
+            if index == 0 {
+                record.absorb_placeholder(binding.clone());
+            } else {
+                record.absorb(binding.clone());
+            }
+        }
+
+        let harness = Plonky3ReplayHarness::new(
+            &fixture.profile,
+            &record,
+            &fixture.manifest,
+            &fixture.events,
+        );
+        let err = harness.verify_full_live().unwrap_err();
+        match err {
+            HarnessError::Manifest(TranscriptBindingError::PlaceholderBinding { domain_label }) => {
+                assert_eq!(domain_label, first_binding.domain_label());
+            }
+            other => panic!("expected PlaceholderBinding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_live_verifier_rejects_declared_backend_event_sources() {
+        let fixture = build_fixture();
+        let mut record = ReferenceBindingRecord::new();
+        for binding in fixture.record.absorbed() {
+            record.absorb(binding.clone());
+        }
+
+        let harness = Plonky3ReplayHarness::new(
+            &fixture.profile,
+            &record,
+            &fixture.manifest,
+            &fixture.events,
+        );
+        let err = harness.verify_full_live().unwrap_err();
+        match err {
+            HarnessError::Manifest(TranscriptBindingError::BindingSourceMismatch {
+                domain_label,
+                expected_source,
+                actual_source,
+            }) => {
+                assert_eq!(domain_label, crate::DOMAIN_PLONKY3_LOG_EXT_DEGREE);
+                assert_eq!(expected_source, TranscriptBindingSource::Live);
+                assert_eq!(actual_source, TranscriptBindingSource::Declared);
+            }
+            other => panic!("expected BindingSourceMismatch, got {other:?}"),
+        }
     }
 
     // ── Adversarial battery ──────────────────────────────────────────────────

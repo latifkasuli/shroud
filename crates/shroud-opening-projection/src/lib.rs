@@ -11,7 +11,8 @@
 use core::fmt;
 
 use shroud_core::{
-    DOMAIN_OPENING_PROJECTION, SecurityLevel, TranscriptBindable, TranscriptBinding,
+    DOMAIN_OPENING_PROJECTION, PerfectClaim, PerfectClaimError, SecurityLevel, TranscriptBindable,
+    TranscriptBinding,
 };
 
 /// How hidden auxiliary opening material is carried through the outer proof.
@@ -137,6 +138,7 @@ impl OpeningProjectionPayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShroudOpeningProjectionSpec {
     security_level: SecurityLevel,
+    perfect_claim: Option<PerfectClaim>,
     shape: OpeningProjectionShape,
     payload: OpeningProjectionPayload,
 }
@@ -150,7 +152,7 @@ impl ShroudOpeningProjectionSpec {
         shape: OpeningProjectionShape,
         auxiliary_transport: AuxiliaryOpeningTransport,
     ) -> Result<Self, OpeningProjectionError> {
-        Self::new(SecurityLevel::Statistical, shape, auxiliary_transport)
+        Self::new_with_claim(SecurityLevel::Statistical, None, shape, auxiliary_transport)
     }
 
     /// Builds a perfect opening-projection object.
@@ -160,8 +162,14 @@ impl ShroudOpeningProjectionSpec {
     pub fn perfect(
         shape: OpeningProjectionShape,
         auxiliary_transport: AuxiliaryOpeningTransport,
+        perfect_claim: PerfectClaim,
     ) -> Result<Self, OpeningProjectionError> {
-        Self::new(SecurityLevel::Perfect, shape, auxiliary_transport)
+        Self::new_with_claim(
+            SecurityLevel::Perfect,
+            Some(perfect_claim),
+            shape,
+            auxiliary_transport,
+        )
     }
 
     /// Builds an opening-projection object with an explicit security level.
@@ -170,9 +178,19 @@ impl ShroudOpeningProjectionSpec {
         shape: OpeningProjectionShape,
         auxiliary_transport: AuxiliaryOpeningTransport,
     ) -> Result<Self, OpeningProjectionError> {
+        Self::new_with_claim(security_level, None, shape, auxiliary_transport)
+    }
+
+    fn new_with_claim(
+        security_level: SecurityLevel,
+        perfect_claim: Option<PerfectClaim>,
+        shape: OpeningProjectionShape,
+        auxiliary_transport: AuxiliaryOpeningTransport,
+    ) -> Result<Self, OpeningProjectionError> {
         let payload = OpeningProjectionPayload::new(shape, auxiliary_transport);
         let spec = Self {
             security_level,
+            perfect_claim,
             shape,
             payload,
         };
@@ -184,6 +202,12 @@ impl ShroudOpeningProjectionSpec {
     #[must_use]
     pub const fn security_level(&self) -> SecurityLevel {
         self.security_level
+    }
+
+    /// Structured justification for a perfect HVZK claim, if this is a perfect variant.
+    #[must_use]
+    pub const fn perfect_claim(&self) -> Option<PerfectClaim> {
+        self.perfect_claim
     }
 
     /// Shape of the projection.
@@ -206,6 +230,27 @@ impl ShroudOpeningProjectionSpec {
 
     /// Validates the shape-level invariants of the projection object.
     pub fn validate(&self) -> Result<(), OpeningProjectionError> {
+        match (self.security_level, self.perfect_claim) {
+            (SecurityLevel::Perfect, None) => {
+                return Err(OpeningProjectionError::PerfectRequiresClaim);
+            }
+            (SecurityLevel::Statistical, Some(_)) => {
+                return Err(OpeningProjectionError::PerfectClaimOnStatisticalSpec);
+            }
+            (_, _) => {}
+        }
+
+        if let Some(claim) = self.perfect_claim {
+            claim.validate()?;
+            let required_query_budget = self.shape.public_opening_values();
+            if claim.query_budget < required_query_budget {
+                return Err(OpeningProjectionError::PerfectClaimQueryBudgetTooSmall {
+                    claim_query_budget: claim.query_budget,
+                    required_query_budget,
+                });
+            }
+        }
+
         if self.payload.public_opening_values() != self.shape.public_opening_values()
             || self.payload.hidden_auxiliary_values() != self.shape.hidden_auxiliary_values()
             || self.payload.verifier_reconstruction_items()
@@ -222,8 +267,15 @@ impl TranscriptBindable for ShroudOpeningProjectionSpec {
     /// Encodes the complete opening-projection spec: security level, shape,
     /// derived payload, and auxiliary transport.
     fn to_transcript_binding(&self) -> TranscriptBinding {
-        let mut bytes = Vec::with_capacity(58);
+        let mut bytes = Vec::with_capacity(81);
         bytes.push(security_level_discriminant(self.security_level()));
+        match self.perfect_claim() {
+            Some(claim) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&claim.to_canonical_bytes());
+            }
+            None => bytes.push(0),
+        }
         let shape = self.shape();
         bytes.extend_from_slice(&(shape.public_opening_values() as u64).to_le_bytes());
         bytes.extend_from_slice(&(shape.hidden_auxiliary_values() as u64).to_le_bytes());
@@ -262,6 +314,19 @@ pub enum OpeningProjectionError {
     ZeroHiddenAuxiliaryValues,
     /// The verifier must have at least one internal reconstruction item.
     ZeroVerifierReconstructionItems,
+    /// Perfect variants must carry a structured `PerfectClaim`.
+    PerfectRequiresClaim,
+    /// Statistical variants must not carry perfect-claim evidence.
+    PerfectClaimOnStatisticalSpec,
+    /// The supplied `PerfectClaim` is internally inconsistent.
+    PerfectClaim(PerfectClaimError),
+    /// The perfect claim query budget does not cover the public opening surface.
+    PerfectClaimQueryBudgetTooSmall {
+        /// Query budget declared by the perfect claim.
+        claim_query_budget: usize,
+        /// Query budget required by the object surface.
+        required_query_budget: usize,
+    },
     /// The derived payload no longer matches the validated shape.
     PayloadShapeMismatch,
 }
@@ -287,6 +352,23 @@ impl fmt::Display for OpeningProjectionError {
                     "opening projection must retain at least one verifier reconstruction item"
                 )
             }
+            Self::PerfectRequiresClaim => write!(
+                f,
+                "perfect opening-projection specs must carry a validated PerfectClaim"
+            ),
+            Self::PerfectClaimOnStatisticalSpec => write!(
+                f,
+                "statistical opening-projection specs must not carry a PerfectClaim"
+            ),
+            Self::PerfectClaim(err) => err.fmt(f),
+            Self::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget,
+                required_query_budget,
+            } => write!(
+                f,
+                "perfect opening-projection claim query budget ({claim_query_budget}) does not \
+                 cover the required public-opening count ({required_query_budget})"
+            ),
             Self::PayloadShapeMismatch => {
                 write!(f, "opening projection payload no longer matches its shape")
             }
@@ -296,13 +378,35 @@ impl fmt::Display for OpeningProjectionError {
 
 impl std::error::Error for OpeningProjectionError {}
 
+impl From<PerfectClaimError> for OpeningProjectionError {
+    fn from(value: PerfectClaimError) -> Self {
+        Self::PerfectClaim(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AuxiliaryOpeningTransport, OpeningProjectionError, OpeningProjectionShape,
         ShroudOpeningProjectionSpec,
     };
-    use shroud_core::SecurityLevel;
+    use shroud_core::{
+        BasisDescriptor, FieldModel, PerfectClaim, RandomnessModel, SecurityLevel,
+        SimulatorObligations,
+    };
+
+    fn valid_perfect_claim(extension_degree: usize, query_budget: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::EncodedCoordinates {
+                basis: BasisDescriptor::plonky3_binomial(extension_degree),
+            },
+            query_budget,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid perfect claim")
+    }
 
     #[test]
     fn statistical_projection_tracks_in_band_auxiliaries() {
@@ -328,13 +432,44 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(2, 2),
         )
         .expect("valid spec");
 
         assert_eq!(spec.security_level(), SecurityLevel::Perfect);
+        assert!(spec.perfect_claim().is_some());
         assert_eq!(spec.payload().public_opening_values(), 2);
         assert_eq!(spec.payload().hidden_auxiliary_values(), 6);
         assert_eq!(spec.payload().verifier_reconstruction_items(), 2);
+    }
+
+    #[test]
+    fn generic_constructor_rejects_perfect_without_claim() {
+        let shape = OpeningProjectionShape::new(2, 6, 2).expect("valid shape");
+        assert_eq!(
+            ShroudOpeningProjectionSpec::new(
+                SecurityLevel::Perfect,
+                shape,
+                AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            ),
+            Err(OpeningProjectionError::PerfectRequiresClaim)
+        );
+    }
+
+    #[test]
+    fn perfect_claim_query_budget_must_cover_public_openings() {
+        let shape = OpeningProjectionShape::new(3, 6, 2).expect("valid shape");
+        assert_eq!(
+            ShroudOpeningProjectionSpec::perfect(
+                shape,
+                AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+                valid_perfect_claim(2, 1),
+            ),
+            Err(OpeningProjectionError::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget: 1,
+                required_query_budget: 3,
+            })
+        );
     }
 
     #[test]
@@ -343,6 +478,7 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::InBandWithMainProof,
+            valid_perfect_claim(2, 2),
         )
         .expect("valid spec");
 

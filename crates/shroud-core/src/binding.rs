@@ -14,7 +14,7 @@
 
 use core::fmt;
 
-use crate::claim::{BasisDescriptor, CoordinateOrder, ReconstructionRule};
+use crate::claim::{BasisDescriptor, CoordinateOrder, PerfectClaim, ReconstructionRule};
 use crate::{DegreeBudget, HidingTechniqueClaim, SecurityLevel, TranscriptStage};
 
 /// Domain label for the SHROUD hiding profile (log-blowup, randomizer count, basis).
@@ -56,6 +56,9 @@ pub const DOMAIN_DEGREE_BUDGET: &str = "SHROUD_V1_DEGREE_BUDGET";
 /// Domain label for a declared hiding-technique claim.
 pub const DOMAIN_HIDING_TECHNIQUE: &str = "SHROUD_V1_HIDING_TECHNIQUE";
 
+/// Domain label for the structured justification behind a perfect HVZK claim.
+pub const DOMAIN_PERFECT_CLAIM: &str = "SHROUD_V1_PERFECT_CLAIM";
+
 /// Domain label for the Fiat-Shamir hash or transcript suite identifier.
 pub const DOMAIN_HASH_ID: &str = "SHROUD_V1_HASH_ID";
 
@@ -96,6 +99,29 @@ impl TranscriptBinding {
     #[must_use]
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
+    }
+}
+
+/// Provenance for a transcript binding absorbed into an audit record.
+///
+/// This is intentionally separate from [`TranscriptBinding`]: canonical bytes
+/// must stay stable and backend-neutral, while provenance is local evidence
+/// about how those bytes entered a verifier record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscriptBindingSource {
+    /// Declared protocol/configuration object supplied by the verifier setup.
+    Declared,
+    /// Bytes extracted from a live backend transcript event or recorder.
+    Live,
+    /// Deliberate planning/deferred placeholder, not acceptable for full live verification.
+    Placeholder,
+}
+
+impl TranscriptBindingSource {
+    /// Returns `true` if this source is a placeholder.
+    #[must_use]
+    pub const fn is_placeholder(self) -> bool {
+        matches!(self, Self::Placeholder)
     }
 }
 
@@ -243,6 +269,20 @@ pub enum TranscriptBindingError {
         /// The domain label whose bytes did not match.
         domain_label: String,
     },
+    /// A full live verification path saw a placeholder binding.
+    PlaceholderBinding {
+        /// The domain label attached to the placeholder binding.
+        domain_label: String,
+    },
+    /// A binding had the expected bytes but the wrong provenance source.
+    BindingSourceMismatch {
+        /// The domain label whose provenance did not match.
+        domain_label: String,
+        /// Provenance required by the verification path.
+        expected_source: TranscriptBindingSource,
+        /// Provenance recorded for the matching binding.
+        actual_source: TranscriptBindingSource,
+    },
 }
 
 impl fmt::Display for TranscriptBindingError {
@@ -260,6 +300,20 @@ impl fmt::Display for TranscriptBindingError {
                 "transcript binding mismatch: a binding for domain label {domain_label:?} \
                  was absorbed, but its canonical bytes do not match the expected value; \
                  this may indicate adversarial substitution of a protocol parameter"
+            ),
+            Self::PlaceholderBinding { domain_label } => write!(
+                f,
+                "placeholder transcript binding is not allowed in full live verification: \
+                 domain label {domain_label:?} was absorbed from a deferred/planning source"
+            ),
+            Self::BindingSourceMismatch {
+                domain_label,
+                expected_source,
+                actual_source,
+            } => write!(
+                f,
+                "transcript binding source mismatch for domain label {domain_label:?}: \
+                 expected {expected_source:?}, got {actual_source:?}"
             ),
         }
     }
@@ -311,6 +365,13 @@ impl TranscriptBindable for HidingTechniqueClaim {
     /// Encodes the hiding-technique claim tree with its own transcript domain.
     fn to_transcript_binding(&self) -> TranscriptBinding {
         TranscriptBinding::new(DOMAIN_HIDING_TECHNIQUE, self.to_canonical_bytes())
+    }
+}
+
+impl TranscriptBindable for PerfectClaim {
+    /// Encodes the structured perfect-claim obligations with their own transcript domain.
+    fn to_transcript_binding(&self) -> TranscriptBinding {
+        TranscriptBinding::new(DOMAIN_PERFECT_CLAIM, self.to_canonical_bytes())
     }
 }
 
@@ -444,23 +505,30 @@ impl TranscriptBindingManifest {
 
     /// Builds the canonical SHROUD v1 batch-opening manifest.
     ///
-    /// Prefer this constructor for backend bridges. The empty [`Self::new`]
-    /// constructor is intended for narrow schedule tests or custom experiments.
+    /// Prefer this constructor for backend bridges. It returns a
+    /// [`CanonicalBatchOpeningManifest`] wrapper so production code does not
+    /// accidentally treat hand-rolled manifests as the reviewed canonical path.
+    /// The empty [`Self::new`] constructor is intended for narrow schedule
+    /// tests or custom experiments.
     #[must_use]
-    pub fn standard_for_batch_opening(bindings: StandardBatchOpeningBindings) -> Self {
-        Self::new()
-            .with_before_batching_challenge(bindings.hash_identifier)
-            .with_before_batching_challenge(bindings.profile)
-            .with_before_batching_challenge(bindings.basis)
-            .with_before_batching_challenge(bindings.batch_opening)
-            .with_before_batching_challenge(bindings.codeword_embedding)
-            .with_before_batching_challenge(bindings.oracle_commitment)
-            .with_before_batching_challenge(bindings.opening_projection)
-            .with_before_batching_challenge(bindings.quotient_hider)
-            .with_before_batching_challenge(bindings.security_level)
-            .with_before_ood_point(bindings.degree_contract)
-            .with_before_ood_point(bindings.randomizer_commitment)
-            .with_before_prove_masked(bindings.public_openings)
+    pub fn standard_for_batch_opening(
+        bindings: StandardBatchOpeningBindings,
+    ) -> CanonicalBatchOpeningManifest {
+        CanonicalBatchOpeningManifest::new(
+            Self::new()
+                .with_before_batching_challenge(bindings.hash_identifier)
+                .with_before_batching_challenge(bindings.profile)
+                .with_before_batching_challenge(bindings.basis)
+                .with_before_batching_challenge(bindings.batch_opening)
+                .with_before_batching_challenge(bindings.codeword_embedding)
+                .with_before_batching_challenge(bindings.oracle_commitment)
+                .with_before_batching_challenge(bindings.opening_projection)
+                .with_before_batching_challenge(bindings.quotient_hider)
+                .with_before_batching_challenge(bindings.security_level)
+                .with_before_ood_point(bindings.degree_contract)
+                .with_before_ood_point(bindings.randomizer_commitment)
+                .with_before_prove_masked(bindings.public_openings),
+        )
     }
 
     /// Adds an expected binding that must be present before `SampleBatchingChallenge`.
@@ -498,6 +566,45 @@ impl TranscriptBindingManifest {
     }
 }
 
+/// Reviewed canonical SHROUD v1 batch-opening manifest.
+///
+/// This wrapper distinguishes the complete standard manifest from bespoke
+/// [`TranscriptBindingManifest`] values built via [`TranscriptBindingManifest::new`].
+/// Backend bridges should accept this type at the boundary where they need the
+/// SHROUD-standard binding set, and call [`Self::into_inner`] only when composing
+/// backend-specific extension slots.
+#[derive(Clone, Debug)]
+pub struct CanonicalBatchOpeningManifest {
+    manifest: TranscriptBindingManifest,
+}
+
+impl CanonicalBatchOpeningManifest {
+    fn new(manifest: TranscriptBindingManifest) -> Self {
+        Self { manifest }
+    }
+
+    /// Returns the underlying manifest for read-only validation.
+    #[must_use]
+    pub const fn as_manifest(&self) -> &TranscriptBindingManifest {
+        &self.manifest
+    }
+
+    /// Consumes the wrapper and returns the underlying manifest.
+    ///
+    /// Use this when composing backend-specific slots onto the canonical
+    /// SHROUD manifest, for example in a Plonky3 bridge manifest.
+    #[must_use]
+    pub fn into_inner(self) -> TranscriptBindingManifest {
+        self.manifest
+    }
+
+    /// Returns the expected canonical bindings for a sampling stage.
+    #[must_use]
+    pub fn required_before(&self, stage: crate::TranscriptStage) -> &[TranscriptBinding] {
+        self.manifest.required_before(stage)
+    }
+}
+
 /// Returns the stable one-byte discriminant for a transcript stage.
 #[must_use]
 pub const fn transcript_stage_discriminant(stage: TranscriptStage) -> u8 {
@@ -523,6 +630,14 @@ fn length_prefixed_bytes(bytes: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::claim::BasisDescriptor;
+
+    struct RawBindable(TranscriptBinding);
+
+    impl TranscriptBindable for RawBindable {
+        fn to_transcript_binding(&self) -> TranscriptBinding {
+            self.0.clone()
+        }
+    }
 
     #[test]
     fn statistical_security_level_encodes_as_zero() {
@@ -640,6 +755,55 @@ mod tests {
             manifest
                 .required_before(TranscriptStage::SampleOodPoint)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn standard_batch_opening_constructor_returns_canonical_wrapper() {
+        let raw = |label, byte| RawBindable(TranscriptBinding::new(label, vec![byte]));
+        let hash_identifier = HashIdentifier::new("test-suite");
+        let bindings = StandardBatchOpeningBindings::from_bindables(
+            &hash_identifier,
+            &raw(DOMAIN_PROFILE, 1),
+            &raw(DOMAIN_BASIS, 2),
+            &raw(DOMAIN_BATCH_OPENING, 3),
+            &raw(DOMAIN_CODEWORD_EMBEDDING, 4),
+            &raw(DOMAIN_ORACLE_COMMITMENT, 5),
+            &raw(DOMAIN_OPENING_PROJECTION, 6),
+            &raw(DOMAIN_QUOTIENT_HIDER, 7),
+            &SecurityLevel::Statistical,
+            &raw(DOMAIN_DEGREE_CONTRACT, 8),
+            &raw(DOMAIN_RANDOMIZER_COMMITMENT, 9),
+            &raw(DOMAIN_PUBLIC_OPENINGS, 10),
+        );
+
+        let canonical = TranscriptBindingManifest::standard_for_batch_opening(bindings);
+
+        assert_eq!(
+            canonical
+                .required_before(TranscriptStage::SampleBatchingChallenge)
+                .len(),
+            9
+        );
+        assert_eq!(
+            canonical
+                .required_before(TranscriptStage::SampleOodPoint)
+                .len(),
+            2
+        );
+        assert_eq!(
+            canonical
+                .required_before(TranscriptStage::ProveMaskedRelation)
+                .first()
+                .map(TranscriptBinding::domain_label),
+            Some(DOMAIN_PUBLIC_OPENINGS)
+        );
+        assert_eq!(
+            canonical
+                .as_manifest()
+                .required_before(TranscriptStage::SampleOodPoint)
+                .len(),
+            2
         );
     }
 

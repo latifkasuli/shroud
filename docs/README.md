@@ -7,6 +7,7 @@ Read them after the protocol notes. Architecture notes explain how SHROUD should
 ## Architecture Notes
 
 - [Lean Normative Spec Restructure](Lean%20Normative%20Spec%20Restructure.md)
+- [SHROUD Maths Bibliography](SHROUD%20Maths%20Bibliography.md)
 - [Adapter Composition Criteria](Adapter%20Composition%20Criteria.md)
 
 ## Current Backend Notes

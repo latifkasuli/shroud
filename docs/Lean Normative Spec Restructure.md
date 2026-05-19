@@ -1,6 +1,6 @@
 # Lean Normative Spec Restructure
 
-**Status:** architecture plan; phase 2 binding manifest started  
+**Status:** architecture plan; phase 5 Rust API tightening started  
 **Scope:** SHROUD core, protocol-object crates, reference model, backend bridges  
 **Decision:** Lean becomes the normative protocol/specification layer; Rust remains the executable integration and backend-audit layer.
 
@@ -8,7 +8,7 @@ This document describes how to restructure SHROUD before publication so that its
 
 The goal is not to turn SHROUD into a Lean prover. The goal is to make SHROUD's protocol rules precise enough that Rust code, backend bridges, papers, and audits can all point to the same formal source of truth.
 
-**Current implementation note:** the repository now contains `lean-toolchain`, `lakefile.lean`, `formal/Shroud/Core/Security.lean`, `formal/Shroud/Core/Transcript.lean`, and `formal/Shroud/Core/Binding.lean`. The initial quality gate is `lake build --wfail`.
+**Current implementation note:** the repository now contains `lean-toolchain`, `lakefile.lean`, core Lean modules under `formal/Shroud/Core/`, and all five first-pass object modules under `formal/Shroud/Objects/`: codeword embedding, batch opening, oracle commitment, quotient hider, and opening projection. Rust perfect constructors now require a structured `PerfectClaim` instead of silently setting `SecurityLevel::Perfect`. The initial quality gate is `lake build --wfail`.
 
 ## 1. Problem SHROUD Is Solving
 
@@ -765,6 +765,18 @@ Exit criteria:
 - `shroud-core/src/degree.rs` and `shroud-quotient-hider` can cite Lean theorem names in comments/docs;
 - Rust proptests remain as executable regression checks.
 
+Current Lean theorem names:
+
+- `DegreeBudget.valid_iff_randomizer_le_relation_succ`;
+- `DegreeBudget.maskedRelationDegreeBound_eq`;
+- `DegreeBudget.valid_implies_randomizerTerm_le_relation`;
+- `DegreeBudget.valid_preservesRelationDegree`;
+- `DegreeBudget.preservesRelationDegree_implies_valid`;
+- `DegreeBudget.valid_iff_preservesRelationDegree`;
+- `QuotientDegreeContract.plain_valid_iff_mask_le_chunk`;
+- `QuotientDegreeContract.vanishing_valid_iff_required_le_bound`;
+- `QuotientDegreeContract.valid_implies_requiredDegree_le_bound`.
+
 ### Phase 4: Formalize Protocol Objects
 
 Goal: model all five SHROUD objects and their payload accounting.
@@ -785,6 +797,48 @@ Exit criteria:
 - object docs cite Lean theorem names for shape/payload laws;
 - Rust constructors mirror Lean validation predicates.
 
+Current Lean theorem names:
+
+- `CodewordEmbeddingPayload.fromShape_committedColumns`;
+- `CodewordEmbeddingPayload.fromShape_publicTraceColumns`;
+- `CodewordEmbeddingPayload.fromShape_hiddenRandomizerColumns`;
+- `ShroudCodewordEmbeddingSpec.valid_implies_randomizerColumns_eq_extensionDegree`;
+- `ShroudCodewordEmbeddingSpec.valid_implies_requiredLogBlowup_atLeastTwo`;
+- `ShroudCodewordEmbeddingSpec.valid_implies_committedColumns_eq_trace_plus_randomizer`;
+- `StatisticalRandomizerSpec.openingPayload_publicExtensionEvaluations`;
+- `StatisticalRandomizerSpec.openingPayload_hiddenBaseFieldCoordinateEvaluations`;
+- `StatisticalRandomizerSpec.fromShape_coordinatePolynomials`;
+- `StatisticalRandomizerSpec.fromShape_openingPayload_hiddenBaseFieldCoordinateEvaluations`;
+- `PerfectRandomizerCommitment.encodedOpeningPayload_publicExtensionEvaluations`;
+- `PerfectRandomizerCommitment.encodedOpeningPayload_hiddenCoordinates`;
+- `PerfectRandomizerCommitment.nativeOpeningPayload_backendProofOnly`;
+- `OracleCommitmentPayload.fromShape_publicCommitments`;
+- `OracleCommitmentPayload.fromShape_publicRowValues`;
+- `OracleCommitmentPayload.fromShape_publicAuthenticationItems`;
+- `OracleCommitmentPayload.fromShape_hiddenHidingWitnessItems`;
+- `ShroudOracleCommitmentSpec.valid_implies_publicRowValues_eq`;
+- `ShroudOracleCommitmentSpec.valid_implies_publicAuthenticationItems_eq`;
+- `ShroudOracleCommitmentSpec.valid_implies_hiddenHidingWitnessItems_eq`;
+- `QuotientHiderPayload.fromShape_publicCommitments`;
+- `QuotientHiderPayload.fromShape_publicOpeningValues`;
+- `QuotientHiderPayload.fromShape_hiddenMaskValues`;
+- `QuotientHiderPayload.fromShape_hiddenNormalizationItems`;
+- `ShroudQuotientHiderSpec.valid_implies_openingPoints_le_queryBudget`;
+- `ShroudQuotientHiderSpec.valid_degreeChunked_implies_degreeContract_isSome`;
+- `ShroudQuotientHiderSpec.valid_implies_degreeContractValidWhenPresent`;
+- `ShroudQuotientHiderSpec.valid_some_degreeContract_implies_contract_valid`;
+- `ShroudQuotientHiderSpec.valid_degreeChunked_implies_exists_valid_degreeContract`;
+- `ShroudQuotientHiderSpec.valid_monolithic_implies_singleComponent`;
+- `ShroudQuotientHiderSpec.valid_implies_publicOpeningValues_eq`;
+- `ShroudQuotientHiderSpec.valid_implies_hiddenMaskValues_eq`;
+- `ShroudQuotientHiderSpec.valid_implies_hiddenNormalizationItems_eq`;
+- `OpeningProjectionPayload.fromShape_publicOpeningValues`;
+- `OpeningProjectionPayload.fromShape_hiddenAuxiliaryValues`;
+- `OpeningProjectionPayload.fromShape_verifierReconstructionItems`;
+- `ShroudOpeningProjectionSpec.valid_implies_publicOpeningValues_eq`;
+- `ShroudOpeningProjectionSpec.valid_implies_hiddenAuxiliaryValues_eq`;
+- `ShroudOpeningProjectionSpec.valid_implies_verifierReconstructionItems_eq`.
+
 ### Phase 5: Rust API Tightening
 
 Goal: make Rust match the new normative spec.
@@ -802,6 +856,21 @@ Exit criteria:
 - Rust API cannot silently make the strongest privacy claims without the supporting objects;
 - placeholder bridge coverage is visible in types;
 - conformance tests catch Lean/Rust drift.
+
+Current implementation notes:
+
+- `PerfectClaim` has a fallible constructor and canonical byte encoding.
+- `PerfectClaim` implements `TranscriptBindable` under `DOMAIN_PERFECT_CLAIM`.
+- Perfect constructors for batch opening, oracle commitment, quotient hider, and opening projection require and store a `PerfectClaim`.
+- Perfect claims are validated against the object surface they certify: batch opening checks extension degree, opening count, and the exact randomizer realization field model; quotient hider checks query budget; oracle commitment checks queried rows; opening projection checks public opening count.
+- Claim-bearing statistical specs are rejected so `perfect_claim()` cannot be non-empty on a statistical object.
+- Generic perfect construction without a claim is rejected for oracle commitment, quotient hider, and opening projection.
+- Perfect spec transcript bindings include the claim payload, so the strongest privacy label carries auditable evidence in the bound object.
+- `TranscriptBindingSource` distinguishes declared configuration bindings, live backend transcript bytes, and explicit placeholders.
+- `ReferenceBindingRecord` tracks binding provenance and can require exact bindings to come from a specific source.
+- The Plonky3 pre-grind harness marks extracted pre-zeta slots as live and deferred post-zeta slots as placeholders; `Plonky3ReplayHarness::verify_full_live` rejects placeholders and requires manifest-covered backend event slots to be sourced as live.
+- `CanonicalBatchOpeningManifest` wraps the reviewed SHROUD v1 batch-opening manifest, separating the complete standard path from bespoke `TranscriptBindingManifest::new()` planning/test manifests.
+- `shroud-conformance` carries fixed Rust fixtures for the first Lean/Rust drift surfaces: canonical manifest stage buckets, complete canonical record finalization, codeword payload accounting, batch-opening statistical/perfect payload accounting, perfect-claim field-model matching, quotient degree/payload accounting, oracle/projection payload accounting, and Plonky3 pre-grind binding-source provenance.
 
 ### Phase 6: Formalize Plonky3 Pre-Grind Boundary
 
@@ -931,16 +1000,16 @@ This backlog gives SHROUD a credible formal foundation without touching backend 
 
 ## 13. Rust Conformance Backlog
 
-After the Lean modules exist, add Rust conformance checks in this order:
+Initial Rust conformance checks now live in `crates/shroud-conformance`:
 
-1. Canonical stage order fixture.
-2. Canonical manifest label bucket fixture.
-3. Degree budget valid/invalid fixture.
-4. Quotient degree contract valid/invalid fixture.
-5. Codeword embedding standard fixture.
-6. Batch-opening statistical payload fixture.
-7. Perfect-claim validation fixture.
-8. Plonky3 pre-grind event grammar fixture.
+1. Canonical stage order and manifest label bucket fixtures.
+2. Complete canonical manifest finalization fixture.
+3. Quotient degree contract valid/invalid fixture.
+4. Codeword embedding standard payload fixture.
+5. Batch-opening statistical and perfect payload fixtures.
+6. Perfect-claim field-model drift fixture.
+7. Oracle-commitment and opening-projection payload fixtures.
+8. Plonky3 pre-grind binding-source fixture.
 
 Each fixture should state:
 
@@ -1017,13 +1086,22 @@ Completed:
 6. Run `lake build --wfail`.
 7. Add `formal/Shroud/Core/Binding.lean`.
 8. Prove initial canonical manifest completeness, no-duplication, and required-before bucket facts.
+9. Add `formal/Shroud/Core/Degree.lean`.
+10. Prove the batch-opening degree-budget and quotient degree-contract theorem set.
+11. Add `formal/Shroud/Objects/CodewordEmbedding.lean`.
+12. Add `formal/Shroud/Objects/BatchOpening.lean`.
+13. Prove initial codeword-embedding and batch-opening payload-accounting laws.
+14. Tighten Rust codeword and batch-opening constructors to reject finite-machine overflow for the exact payload arithmetic modeled in Lean.
+15. Add `formal/Shroud/Objects/OracleCommitment.lean`.
+16. Add `formal/Shroud/Objects/QuotientHider.lean`.
+17. Add `formal/Shroud/Objects/OpeningProjection.lean`.
+18. Prove initial oracle-commitment, quotient-hider, and opening-projection payload-accounting laws.
+19. Tighten Rust oracle-commitment and quotient-hider constructors to reject finite-machine overflow for the exact payload arithmetic modeled in Lean.
+20. Start Phase 5 by requiring `PerfectClaim` in Rust perfect constructors and embedding the claim in perfect object transcript bindings.
 
 Next:
 
-1. Add `formal/Shroud/Core/Degree.lean`.
-2. Prove the batch-opening degree-budget theorem.
-3. Add Rust comments linking `TranscriptPlan` and `DegreeBudget` to those theorem names.
-4. Only then tighten `PerfectClaim` and manifest APIs.
+1. Add Rust comments linking `TranscriptPlan`, `DegreeBudget`, quotient degree contracts, and payload-accounting formulas to Lean theorem names.
 
 This sequence gives SHROUD immediate formal value without disrupting the Plonky3 bridge work.
 

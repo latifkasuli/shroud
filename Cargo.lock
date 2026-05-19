@@ -864,6 +864,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shroud-conformance"
+version = "0.1.0"
+dependencies = [
+ "shroud-batch-opening",
+ "shroud-codeword-embedding",
+ "shroud-core",
+ "shroud-opening-projection",
+ "shroud-oracle-commitment",
+ "shroud-plonky3",
+ "shroud-quotient-hider",
+ "shroud-reference",
+]
+
+[[package]]
 name = "shroud-core"
 version = "0.1.0"
 dependencies = [

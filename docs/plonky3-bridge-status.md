@@ -31,8 +31,9 @@ This document is the **frozen contract** for what the bridge does and does not c
 The bridge validates the **pre-grind portion** of a live `HidingFriPcs` transcript against SHROUD-canonical and Plonky3-extended bindings, using the production API in `crates/shroud-plonky3/src`:
 
 - `live_extractor::extract_pre_grind_slices` — structurally walks the recorder event log; typed `LiveExtractionError` (`TruncatedLog`, `SampledInObserveBlock`, `ObservedBlockOvershoot`, `MissingChallengeSample`) on drift; no panics.
-- `live_harness::build_pre_grind_harness_input` — composes the extraction into `(profile, record, manifest, prefix_events)`.
+- `live_harness::build_pre_grind_harness_input` — composes the extraction into `(profile, record, manifest, prefix_events)` and marks extracted pre-zeta bindings as `TranscriptBindingSource::Live`.
 - `replay_harness::Plonky3ReplayHarness::verify` — runs provenance → manifest → byte-equivalence replay in fail-fast order.
+- `replay_harness::Plonky3ReplayHarness::verify_full_live` — additionally rejects `TranscriptBindingSource::Placeholder` and requires manifest-covered backend event slots to be sourced as `TranscriptBindingSource::Live`; this is expected to fail for the current pre-grind bridge until post-zeta slots are live.
 
 **Events covered (matching `docs/Plonky3 Mapping.md` rows 1-10):**
 
@@ -51,7 +52,7 @@ The bridge validates the **pre-grind portion** of a live `HidingFriPcs` transcri
 
 ## What is intentionally placeholder
 
-These slots **exist in the manifest and record** (so `ReferenceBindingRecord::finalize` succeeds end-to-end), but their bytes are **caller-supplied placeholders**, not live recorder output. They are bound in the SHROUD/Plonky3 manifest schema for future phase-3 work; they do **not** participate in live byte-equivalence verification.
+These slots **exist in the manifest and record** (so `ReferenceBindingRecord::finalize` succeeds end-to-end), but their bytes are **caller-supplied placeholders**, not live recorder output. They are recorded with `TranscriptBindingSource::Placeholder`, bound in the SHROUD/Plonky3 manifest schema for future phase-3 work, and rejected by `verify_full_live`; they do **not** participate in live byte-equivalence verification.
 
 Field on `Plonky3LiveHarnessConfig` | Manifest slot | Why placeholder
 ---|---|---

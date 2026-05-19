@@ -20,8 +20,8 @@ Read alongside:
 | Concern | Symbol |
 |---|---|
 | Typed binding for every protocol object | `TranscriptBindable` (`shroud-core/src/binding.rs:108`) |
-| Compile-time-enforced complete manifest | `StandardBatchOpeningBindings::from_bindables` (`shroud-core/src/binding.rs:342`) |
-| Canonical schedule mapping bindings to challenge points | `TranscriptBindingManifest::standard_for_batch_opening` (`shroud-core/src/binding.rs:417`) |
+| Compile-time-enforced complete binding set | `StandardBatchOpeningBindings::from_bindables` (`shroud-core/src/binding.rs`) |
+| Reviewed canonical manifest wrapper | `CanonicalBatchOpeningManifest`, returned by `TranscriptBindingManifest::standard_for_batch_opening(...)` |
 | Per-sampling-stage enforcement at runtime | `ReferenceTranscript::advance` (`shroud-reference/src/lib.rs`) calls `assert_exact_present(manifest.required_before(stage))` |
 
 `from_bindables` takes ten typed `TranscriptBindable` generic params — a bridge using the canonical constructor *cannot* silently omit a binding; the compiler catches it.
@@ -62,10 +62,12 @@ Substituting one object's bytes under another's label triggers `TranscriptBindin
 
 **SHROUD answer.**
 
-- **Strong path (recommended for all bridges):** `StandardBatchOpeningBindings::from_bindables(...)` → `TranscriptBindingManifest::standard_for_batch_opening(...)`. Compile-time check that every typed binding is supplied.
+- **Strong path (recommended for all bridges):** `StandardBatchOpeningBindings::from_bindables(...)` → `TranscriptBindingManifest::standard_for_batch_opening(...)` → `CanonicalBatchOpeningManifest`. Compile-time check that every typed binding is supplied, plus a distinct wrapper type for the reviewed SHROUD v1 manifest.
+- **Backend extension path:** a bridge that appends backend-specific slots, such as Plonky3, must explicitly call `CanonicalBatchOpeningManifest::into_inner()` before composing extension bindings. That call is the review marker: after it, the result is again a raw `TranscriptBindingManifest` because the bridge has deliberately moved beyond the core canonical SHROUD schedule.
+- **Canonical validation path:** code that wants exactly the reviewed SHROUD v1 manifest should pass `CanonicalBatchOpeningManifest` to `ReferenceBindingRecord::finalize_canonical(...)` instead of treating a raw `TranscriptBindingManifest` as canonical.
 - **Weak path (test-only / experimental):** `TranscriptBindingManifest::new()` + `with_before_*` builders. Documented with a "Dangerous: hand-rolled" doctest on `TranscriptBindingManifest::new` (`shroud-core/src/binding.rs:408`) showing that a half-empty manifest is buildable and the only defense is calling-convention discipline.
 
-Bridges should default to the strong path. The weak path exists so narrow schedule tests can construct minimal manifests; using it in production-facing code is a review red flag.
+Bridges should default to the strong path. The weak path exists so narrow schedule tests can construct minimal manifests; using it in production-facing code without an explicit backend-extension rationale is a review red flag.
 
 ---
 
@@ -182,7 +184,7 @@ The canonical per-stage label sequence (in the order they are absorbed):
 - Before `SampleOodPoint`: `DOMAIN_DEGREE_CONTRACT`, `DOMAIN_RANDOMIZER_COMMITMENT`.
 - Before `ProveMaskedRelation`: `DOMAIN_PUBLIC_OPENINGS`.
 
-**Source of truth.** The above list is locked by `standard_manifest_per_stage_label_sequence_is_canonical` in `shroud-reference/src/lib.rs`. The test re-derives each per-stage sequence from `TranscriptBindingManifest::standard_for_batch_opening` and asserts byte-equality with the hard-coded expected order. Any future refactor that reorders bindings without updating this doc fails CI. Treat the test name as canonical — if it and this prose disagree, the test wins.
+**Source of truth.** The above list is locked by `standard_manifest_per_stage_label_sequence_is_canonical` in `shroud-reference/src/lib.rs`. The test re-derives each per-stage sequence from the `CanonicalBatchOpeningManifest` returned by `TranscriptBindingManifest::standard_for_batch_opening(...)` and asserts byte-equality with the hard-coded expected order. Any future refactor that reorders bindings without updating this doc fails CI. Treat the test name as canonical — if it and this prose disagree, the test wins.
 
 Additionally, `ReferenceTranscript::finish` (`shroud-reference/src/lib.rs:149`) enforces that every sampling stage actually recorded a challenge (`MissingSampledChallenge`) — catches the "advance past a sample stage without sampling" silent-skip bug.
 
@@ -233,7 +235,7 @@ When a new SHROUD object lands:
 
 1. **Domain label.** Add a `DOMAIN_*` constant in `shroud-core/src/binding.rs`. Distinct from all existing labels (the `domain_labels_are_distinct_across_all_constants` test enforces this).
 2. **Canonical binding.** Implement `TranscriptBindable` with a stable little-endian encoding of every field that influences a challenge.
-3. **Manifest routing.** Decide which sampling stage absorbs it. Add a binding slot in `StandardBatchOpeningBindings` and a `with_before_*` call in `standard_for_batch_opening`.
+3. **Manifest routing.** Decide which sampling stage absorbs it. Add a binding slot in `StandardBatchOpeningBindings` and a `with_before_*` call in `standard_for_batch_opening`, preserving the `CanonicalBatchOpeningManifest` wrapper as the reviewed standard artifact.
 4. **Verifier independence.** Document which fields the verifier re-derives independently (vs trusts from the proof). If pinned to a backend, add a drift-detection function in the canonical `verify_profile_matches_backend` shape.
 5. **Randomness audit.** If the object introduces a new randomness source, document the required `RandomnessModel` and the backend obligation.
 

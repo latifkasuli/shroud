@@ -1,0 +1,19 @@
+[package]
+name = "shroud-conformance"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+shroud-batch-opening = { path = "../shroud-batch-opening" }
+shroud-codeword-embedding = { path = "../shroud-codeword-embedding" }
+shroud-core = { path = "../shroud-core" }
+shroud-opening-projection = { path = "../shroud-opening-projection" }
+shroud-oracle-commitment = { path = "../shroud-oracle-commitment" }
+shroud-plonky3 = { path = "../shroud-plonky3" }
+shroud-quotient-hider = { path = "../shroud-quotient-hider" }
+shroud-reference = { path = "../shroud-reference" }
+
+[lib]
+path = "src/lib.rs"

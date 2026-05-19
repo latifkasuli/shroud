@@ -244,29 +244,34 @@ pub fn build_pre_grind_harness_input(
     record.absorb_bindable(config.degree_contract);
 
     // (b) Plonky3 transcript-order absorption.
-    record.absorb(bindings.log_ext_degree().clone());
-    record.absorb(bindings.log_degree().clone());
-    record.absorb(bindings.preprocessed_width().clone());
-    record.absorb(bindings.trace_commitment().clone());
+    record.absorb_live(bindings.log_ext_degree().clone());
+    record.absorb_live(bindings.log_degree().clone());
+    record.absorb_live(bindings.preprocessed_width().clone());
+    record.absorb_live(bindings.trace_commitment().clone());
     if let Some(pre) = bindings.preprocessed_commitment() {
-        record.absorb(pre.clone());
+        record.absorb_live(pre.clone());
     }
-    record.absorb(bindings.air_public_values().clone());
+    record.absorb_live(bindings.air_public_values().clone());
     // (sample α — no observed bytes between trace_commit and
     //  quotient_commit)
-    record.absorb(bindings.quotient_commitment().clone());
+    record.absorb_live(bindings.quotient_commitment().clone());
     // DOMAIN_RANDOMIZER_COMMITMENT slots HERE — between QUOTIENT and ζ
     // — matching Plonky3 event 9 (ZK-only).
-    record.absorb_bindable(&randomizer);
+    record.absorb_bindable_with_source(&randomizer, shroud_core::TranscriptBindingSource::Live);
     // (sample ζ — no observed bytes between randomizer_commit and
     //  opened_values)
-    record.absorb(bindings.opened_values().clone());
-    record.absorb(bindings.fri_commit_phase_commitments().clone());
-    record.absorb(bindings.fri_final_poly().clone());
-    record.absorb(bindings.fri_log_arities().clone());
+    record.absorb_placeholder(bindings.opened_values().clone());
+    record.absorb_placeholder(bindings.fri_commit_phase_commitments().clone());
+    record.absorb_placeholder(bindings.fri_final_poly().clone());
+    record.absorb_placeholder(bindings.fri_log_arities().clone());
 
-    // public_openings: SHROUD-canonical post-zeta binding.
-    record.absorb_bindable(config.public_openings);
+    // public_openings: SHROUD-canonical post-zeta binding. This is
+    // placeholder-sourced until post-zeta extraction can derive it from live
+    // opened-values bytes.
+    record.absorb_bindable_with_source(
+        config.public_openings,
+        shroud_core::TranscriptBindingSource::Placeholder,
+    );
 
     Plonky3LiveHarnessInput {
         profile: config.profile.clone(),
@@ -389,6 +394,7 @@ mod tests {
     use crate::Plonky3HashIdentifier;
     use shroud_batch_opening::BatchOpeningShape;
     use shroud_codeword_embedding::CodewordEmbeddingShape;
+    use shroud_core::{TranscriptBindingError, TranscriptBindingSource};
     use shroud_opening_projection::{AuxiliaryOpeningTransport, OpeningProjectionShape};
     use shroud_oracle_commitment::{OracleAuxiliaryTransport, OracleCommitmentShape};
     use shroud_quotient_hider::{
@@ -489,10 +495,27 @@ mod tests {
             .iter()
             .position(|l| *l == DOMAIN_RANDOMIZER_COMMITMENT)
             .expect("randomizer commit absorbed");
+        let opened_values_pos = labels
+            .iter()
+            .position(|l| *l == crate::DOMAIN_PLONKY3_OPENED_VALUES)
+            .expect("opened-values placeholder absorbed");
         assert!(
             q_pos < r_pos,
             "Plonky3 transcript order: QUOTIENT_COMMITMENT must precede \
              RANDOMIZER_COMMITMENT in the absorbed record (got q={q_pos}, r={r_pos})"
+        );
+        assert_eq!(input.record.source_at(q_pos), TranscriptBindingSource::Live);
+        assert_eq!(input.record.source_at(r_pos), TranscriptBindingSource::Live);
+        assert_eq!(
+            input.record.source_at(opened_values_pos),
+            TranscriptBindingSource::Placeholder
+        );
+        assert!(input.record.contains_placeholder_binding());
+        assert_eq!(
+            input.record.assert_no_placeholder_bindings(),
+            Err(TranscriptBindingError::PlaceholderBinding {
+                domain_label: crate::DOMAIN_PLONKY3_OPENED_VALUES.to_string(),
+            })
         );
 
         // No preprocessed_commit field on the extraction → the

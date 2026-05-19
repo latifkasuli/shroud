@@ -198,7 +198,7 @@ impl fmt::Display for SimulatorObligations {
 /// internally inconsistent if the query budget is zero or the MMCS is non-hiding.
 /// A non-hiding MMCS leaks witness row values on query, which defeats polynomial
 /// randomization regardless of how many randomizer columns are appended.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfectClaim {
     /// The source of randomness used by the commitment.
     pub randomness_model: RandomnessModel,
@@ -216,6 +216,25 @@ pub struct PerfectClaim {
 }
 
 impl PerfectClaim {
+    /// Builds and validates a structured perfect HVZK claim.
+    pub fn new(
+        randomness_model: RandomnessModel,
+        field_model: FieldModel,
+        query_budget: usize,
+        simulator_obligations: SimulatorObligations,
+        hiding_mmcs: bool,
+    ) -> Result<Self, PerfectClaimError> {
+        let claim = Self {
+            randomness_model,
+            field_model,
+            query_budget,
+            simulator_obligations,
+            hiding_mmcs,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
     /// Validates internal consistency of the claim.
     ///
     /// This does not verify the claim against a concrete backend. It only
@@ -231,6 +250,58 @@ impl PerfectClaim {
             return Err(PerfectClaimError::NonHidingMmcs);
         }
         Ok(())
+    }
+
+    /// Encodes the perfect-claim fields into stable canonical bytes.
+    #[must_use]
+    pub fn to_canonical_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(31);
+        bytes.push(randomness_model_discriminant(self.randomness_model));
+        match self.field_model {
+            FieldModel::EncodedCoordinates { basis } => {
+                bytes.push(0);
+                bytes.extend_from_slice(&(basis.extension_degree as u64).to_le_bytes());
+                bytes.push(coordinate_order_discriminant(basis.coordinate_order));
+                bytes.push(reconstruction_rule_discriminant(basis.reconstruction_rule));
+            }
+            FieldModel::NativeExtension { extension_degree } => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(extension_degree as u64).to_le_bytes());
+                bytes.extend_from_slice(&[0, 0]);
+            }
+        }
+        bytes.extend_from_slice(&(self.query_budget as u64).to_le_bytes());
+        bytes.push(simulator_obligations_discriminant(
+            self.simulator_obligations,
+        ));
+        bytes.push(u8::from(self.hiding_mmcs));
+        bytes
+    }
+}
+
+const fn randomness_model_discriminant(model: RandomnessModel) -> u8 {
+    match model {
+        RandomnessModel::UniformPerProof => 0,
+        RandomnessModel::CsprngFromOsEntropy => 1,
+    }
+}
+
+const fn coordinate_order_discriminant(order: CoordinateOrder) -> u8 {
+    match order {
+        CoordinateOrder::LittleEndianMonomial => 0,
+    }
+}
+
+const fn reconstruction_rule_discriminant(rule: ReconstructionRule) -> u8 {
+    match rule {
+        ReconstructionRule::BinomialExtension => 0,
+    }
+}
+
+const fn simulator_obligations_discriminant(obligations: SimulatorObligations) -> u8 {
+    match obligations {
+        SimulatorObligations::HonestVerifierChallengeAccess => 0,
+        SimulatorObligations::FullyOblivious => 1,
     }
 }
 

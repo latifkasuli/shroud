@@ -308,7 +308,7 @@ Once `Plonky3ExtendedBindings` is implemented, the bridge replay test must:
 
 1. Generate a proof with the pinned `HidingBackend` config on a minimal AIR; capture the proof artifacts and the replayable transcript event stream.
 2. Construct a `Plonky3ExtendedBindings` from the proof artifacts and pinned profile.
-3. Build a `TranscriptBindingManifest::standard_for_batch_opening(...)` composed with the bridge wrapper.
+3. Build the `CanonicalBatchOpeningManifest` via `TranscriptBindingManifest::standard_for_batch_opening(...)`, explicitly call `into_inner()` at the Plonky3 extension boundary, then compose the Plonky3-specific slots.
 4. Build a `Plonky3TranscriptChallengeDeriver` that wraps `SerializingChallenger32` and replays each `SampledChallenge` from the absorbed prefix.
 5. Run `ReferenceTranscript::finish(deriver)` and assert `Ok(())`.
 

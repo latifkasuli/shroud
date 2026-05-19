@@ -1,3 +1,9 @@
 import Shroud.Core.Binding
+import Shroud.Core.Degree
 import Shroud.Core.Security
 import Shroud.Core.Transcript
+import Shroud.Objects.BatchOpening
+import Shroud.Objects.CodewordEmbedding
+import Shroud.Objects.OpeningProjection
+import Shroud.Objects.OracleCommitment
+import Shroud.Objects.QuotientHider

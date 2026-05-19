@@ -64,6 +64,12 @@ impl CodewordEmbeddingShape {
         if extension_degree == 0 {
             return Err(CodewordEmbeddingError::ZeroExtensionDegree);
         }
+        if trace_columns.checked_add(randomizer_columns).is_none() {
+            return Err(CodewordEmbeddingError::CommittedColumnsOverflow {
+                trace_columns,
+                randomizer_columns,
+            });
+        }
 
         Ok(Self {
             trace_columns,
@@ -88,7 +94,7 @@ impl CodewordEmbeddingShape {
     /// Total committed columns: trace columns plus randomizer columns.
     #[must_use]
     pub const fn committed_columns(self) -> usize {
-        self.trace_columns.saturating_add(self.randomizer_columns)
+        self.trace_columns + self.randomizer_columns
     }
 
     /// Log base 2 of the trace evaluation domain size.
@@ -353,6 +359,17 @@ pub enum CodewordEmbeddingError {
     },
     /// The derived payload no longer matches the validated shape.
     PayloadShapeMismatch,
+    /// The committed column count `trace_columns + randomizer_columns` overflowed `usize`.
+    ///
+    /// SHROUD's normative Lean model uses exact natural-number addition for
+    /// payload accounting. Rust must reject shapes whose exact count cannot be
+    /// represented by `usize`.
+    CommittedColumnsOverflow {
+        /// Number of public trace columns.
+        trace_columns: usize,
+        /// Number of hidden randomizer columns.
+        randomizer_columns: usize,
+    },
     /// `SecurityLevel::Perfect` requires a `PerfectClaim`; use a dedicated
     /// perfect constructor that carries and validates the claim.
     PerfectRequiresClaim,
@@ -393,6 +410,14 @@ impl fmt::Display for CodewordEmbeddingError {
             Self::PayloadShapeMismatch => {
                 write!(f, "codeword embedding payload no longer matches its shape")
             }
+            Self::CommittedColumnsOverflow {
+                trace_columns,
+                randomizer_columns,
+            } => write!(
+                f,
+                "codeword embedding committed column count overflows usize: \
+                 trace_columns ({trace_columns}) + randomizer_columns ({randomizer_columns})"
+            ),
             Self::PerfectRequiresClaim => write!(
                 f,
                 "SecurityLevel::Perfect requires a PerfectClaim; \
@@ -511,6 +536,17 @@ mod tests {
         assert_eq!(
             CodewordEmbeddingShape::new(0, 4, 8, 4),
             Err(CodewordEmbeddingError::ZeroTraceColumns)
+        );
+    }
+
+    #[test]
+    fn rejects_committed_columns_overflow() {
+        assert_eq!(
+            CodewordEmbeddingShape::new(usize::MAX, 1, 8, 1),
+            Err(CodewordEmbeddingError::CommittedColumnsOverflow {
+                trace_columns: usize::MAX,
+                randomizer_columns: 1,
+            })
         );
     }
 

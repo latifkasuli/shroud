@@ -13,9 +13,9 @@
 use core::fmt;
 
 use shroud_core::{
-    BasisDescriptor, DOMAIN_BATCH_OPENING, DegreeBudget, DegreeBudgetError, SecurityLevel,
-    TranscriptBindable, TranscriptBinding, TranscriptPlan, TranscriptPlanError,
-    transcript_stage_discriminant,
+    BasisDescriptor, DOMAIN_BATCH_OPENING, DegreeBudget, DegreeBudgetError, FieldModel,
+    PerfectClaim, PerfectClaimError, SecurityLevel, TranscriptBindable, TranscriptBinding,
+    TranscriptPlan, TranscriptPlanError, transcript_stage_discriminant,
 };
 
 /// Statement shape for a reduced batch-opening relation.
@@ -41,6 +41,12 @@ impl BatchOpeningShape {
         }
         if extension_degree == 0 {
             return Err(BatchOpeningSpecError::ZeroExtensionDegree);
+        }
+        if opening_points.checked_mul(extension_degree).is_none() {
+            return Err(BatchOpeningSpecError::RandomizerPayloadOverflow {
+                opening_points,
+                extension_degree,
+            });
         }
 
         Ok(Self {
@@ -120,9 +126,8 @@ impl StatisticalRandomizerSpec {
     ) -> StatisticalRandomizerOpeningPayload {
         StatisticalRandomizerOpeningPayload {
             public_extension_evaluations: shape.opening_points(),
-            hidden_base_field_coordinate_evaluations: shape
-                .opening_points()
-                .saturating_mul(self.coordinate_polynomials),
+            hidden_base_field_coordinate_evaluations: shape.opening_points()
+                * self.coordinate_polynomials,
             proof_slot_layout: ProofSlotLayout::ReuseCurrentRandomSlot,
             hidden_opening_transport: HiddenOpeningTransport::InBandWithMainOpeningProof,
         }
@@ -535,9 +540,8 @@ impl PerfectRandomizerCommitment {
                 PerfectRandomizerOpeningPayload {
                     public_extension_evaluations: shape.opening_points(),
                     hidden_payload: PerfectHiddenOpeningPayload::EncodedCoordinates {
-                        base_field_coordinate_evaluations: shape
-                            .opening_points()
-                            .saturating_mul(basis.extension_degree),
+                        base_field_coordinate_evaluations: shape.opening_points()
+                            * basis.extension_degree,
                         transport: HiddenOpeningTransport::InBandWithMainOpeningProof,
                     },
                     proof_slot_layout: self.proof_slot_layout,
@@ -567,6 +571,7 @@ pub enum RandomizerSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShroudBatchOpeningSpec {
     security_level: SecurityLevel,
+    perfect_claim: Option<PerfectClaim>,
     shape: BatchOpeningShape,
     degree_budget: DegreeBudget,
     transcript_plan: TranscriptPlan,
@@ -580,9 +585,12 @@ impl ShroudBatchOpeningSpec {
         shape: BatchOpeningShape,
         relation_degree: usize,
     ) -> Result<Self, BatchOpeningSpecError> {
+        let randomizer_degree = relation_degree
+            .checked_add(1)
+            .ok_or(BatchOpeningSpecError::RandomizerDegreeOverflow { relation_degree })?;
         Self::statistical_with_degree_budget(
             shape,
-            DegreeBudget::new(relation_degree, relation_degree.saturating_add(1))?,
+            DegreeBudget::new(relation_degree, randomizer_degree)?,
         )
     }
 
@@ -593,6 +601,7 @@ impl ShroudBatchOpeningSpec {
     ) -> Result<Self, BatchOpeningSpecError> {
         Self::new(
             SecurityLevel::Statistical,
+            None,
             shape,
             degree_budget,
             TranscriptPlan::standard_batch_opening(),
@@ -606,11 +615,16 @@ impl ShroudBatchOpeningSpec {
         shape: BatchOpeningShape,
         relation_degree: usize,
         commitment: PerfectRandomizerCommitment,
+        perfect_claim: PerfectClaim,
     ) -> Result<Self, BatchOpeningSpecError> {
+        let randomizer_degree = relation_degree
+            .checked_add(1)
+            .ok_or(BatchOpeningSpecError::RandomizerDegreeOverflow { relation_degree })?;
         Self::perfect_with_degree_budget(
             shape,
-            DegreeBudget::new(relation_degree, relation_degree.saturating_add(1))?,
+            DegreeBudget::new(relation_degree, randomizer_degree)?,
             commitment,
+            perfect_claim,
         )
     }
 
@@ -619,9 +633,11 @@ impl ShroudBatchOpeningSpec {
         shape: BatchOpeningShape,
         degree_budget: DegreeBudget,
         commitment: PerfectRandomizerCommitment,
+        perfect_claim: PerfectClaim,
     ) -> Result<Self, BatchOpeningSpecError> {
         Self::new(
             SecurityLevel::Perfect,
+            Some(perfect_claim),
             shape,
             degree_budget,
             TranscriptPlan::standard_batch_opening(),
@@ -634,6 +650,12 @@ impl ShroudBatchOpeningSpec {
     #[must_use]
     pub const fn security_level(&self) -> SecurityLevel {
         self.security_level
+    }
+
+    /// Structured justification for a perfect HVZK claim, if this is a perfect variant.
+    #[must_use]
+    pub const fn perfect_claim(&self) -> Option<PerfectClaim> {
+        self.perfect_claim
     }
 
     /// Returns the statement shape.
@@ -668,6 +690,7 @@ impl ShroudBatchOpeningSpec {
 
     fn new(
         security_level: SecurityLevel,
+        perfect_claim: Option<PerfectClaim>,
         shape: BatchOpeningShape,
         degree_budget: DegreeBudget,
         transcript_plan: TranscriptPlan,
@@ -676,6 +699,7 @@ impl ShroudBatchOpeningSpec {
     ) -> Result<Self, BatchOpeningSpecError> {
         let spec = Self {
             security_level,
+            perfect_claim,
             shape,
             degree_budget,
             transcript_plan,
@@ -718,10 +742,14 @@ impl ShroudBatchOpeningSpec {
     pub fn validate(&self) -> Result<(), BatchOpeningSpecError> {
         self.transcript_plan.validate()?;
 
-        if self.security_level == SecurityLevel::Perfect
-            && self.commitment_boundary != CommitmentBoundary::DedicatedAuxiliaryPath
-        {
-            return Err(BatchOpeningSpecError::PerfectVariantNeedsDedicatedAuxiliaryBoundary);
+        match (self.security_level, self.perfect_claim) {
+            (SecurityLevel::Perfect, None) => {
+                return Err(BatchOpeningSpecError::PerfectRequiresClaim);
+            }
+            (SecurityLevel::Statistical, Some(_)) => {
+                return Err(BatchOpeningSpecError::PerfectClaimOnStatisticalSpec);
+            }
+            (_, _) => {}
         }
 
         if let RandomizerSpec::Perfect(commitment) = self.randomizer
@@ -737,6 +765,51 @@ impl ShroudBatchOpeningSpec {
             }
         }
 
+        if let Some(claim) = self.perfect_claim {
+            claim.validate()?;
+            let claim_degree = claim.field_model.extension_degree();
+            let shape_degree = self.shape.extension_degree();
+            if claim_degree != shape_degree {
+                return Err(BatchOpeningSpecError::PerfectClaimExtensionDegreeMismatch {
+                    claim_degree,
+                    shape_degree,
+                });
+            }
+            let required_query_budget = self.shape.opening_points();
+            if claim.query_budget < required_query_budget {
+                return Err(BatchOpeningSpecError::PerfectClaimQueryBudgetTooSmall {
+                    claim_query_budget: claim.query_budget,
+                    required_query_budget,
+                });
+            }
+            if let RandomizerSpec::Perfect(commitment) = self.randomizer {
+                match (claim.field_model, commitment.realization()) {
+                    (
+                        FieldModel::EncodedCoordinates { basis: claim_basis },
+                        PerfectRandomizerRealization::EncodedOracleBundle {
+                            basis: commitment_basis,
+                        },
+                    ) if claim_basis == commitment_basis => {}
+                    (
+                        FieldModel::NativeExtension { extension_degree },
+                        PerfectRandomizerRealization::NativeExtensionPcs,
+                    ) if extension_degree == shape_degree => {}
+                    (claim_field_model, realization) => {
+                        return Err(BatchOpeningSpecError::PerfectClaimFieldModelMismatch {
+                            claim_field_model,
+                            realization,
+                        });
+                    }
+                }
+            }
+        }
+
+        if self.security_level == SecurityLevel::Perfect
+            && self.commitment_boundary != CommitmentBoundary::DedicatedAuxiliaryPath
+        {
+            return Err(BatchOpeningSpecError::PerfectVariantNeedsDedicatedAuxiliaryBoundary);
+        }
+
         Ok(())
     }
 }
@@ -747,6 +820,13 @@ impl TranscriptBindable for ShroudBatchOpeningSpec {
     fn to_transcript_binding(&self) -> TranscriptBinding {
         let mut bytes = Vec::new();
         bytes.push(security_level_discriminant(self.security_level()));
+        match self.perfect_claim() {
+            Some(claim) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&claim.to_canonical_bytes());
+            }
+            None => bytes.push(0),
+        }
         let shape = self.shape();
         bytes.extend_from_slice(&(shape.committed_polynomials() as u64).to_le_bytes());
         bytes.extend_from_slice(&(shape.opening_points() as u64).to_le_bytes());
@@ -805,10 +885,56 @@ pub enum BatchOpeningSpecError {
     ZeroOpeningPoints,
     /// The extension field degree must be positive.
     ZeroExtensionDegree,
+    /// The hidden randomizer payload count `opening_points * extension_degree` overflowed `usize`.
+    ///
+    /// SHROUD's normative Lean model uses exact natural-number multiplication
+    /// for payload accounting. Rust must reject shapes whose exact count cannot
+    /// be represented by `usize`.
+    RandomizerPayloadOverflow {
+        /// Number of opening points in the batched claim.
+        opening_points: usize,
+        /// Extension degree of the opening field.
+        extension_degree: usize,
+    },
+    /// The default randomizer degree `relation_degree + 1` overflowed `usize`.
+    ///
+    /// SHROUD's normative Lean model uses exact natural-number addition for the
+    /// one-degree slack in `(R(X) - R(zeta)) / (X - zeta)`.
+    RandomizerDegreeOverflow {
+        /// Requested relation degree.
+        relation_degree: usize,
+    },
     /// The randomizer degree breaks the masked-relation degree class.
     DegreeBudget(DegreeBudgetError),
     /// The transcript order breaks a SHROUD invariant.
     Transcript(TranscriptPlanError),
+    /// Perfect variants must carry a structured `PerfectClaim`.
+    PerfectRequiresClaim,
+    /// Statistical variants must not carry perfect-claim evidence.
+    PerfectClaimOnStatisticalSpec,
+    /// The supplied `PerfectClaim` is internally inconsistent.
+    PerfectClaim(PerfectClaimError),
+    /// The perfect claim's field model does not match the batch-opening field.
+    PerfectClaimExtensionDegreeMismatch {
+        /// Extension degree declared by the perfect claim.
+        claim_degree: usize,
+        /// Extension degree required by the batch-opening shape.
+        shape_degree: usize,
+    },
+    /// The perfect claim query budget does not cover the batch-opening surface.
+    PerfectClaimQueryBudgetTooSmall {
+        /// Query budget declared by the perfect claim.
+        claim_query_budget: usize,
+        /// Query budget required by the object surface.
+        required_query_budget: usize,
+    },
+    /// The perfect claim field model does not match the randomizer realization.
+    PerfectClaimFieldModelMismatch {
+        /// Field model declared by the perfect claim.
+        claim_field_model: FieldModel,
+        /// Randomizer realization selected by the batch-opening object.
+        realization: PerfectRandomizerRealization,
+    },
     /// The perfect variant must use a dedicated auxiliary commitment boundary.
     PerfectVariantNeedsDedicatedAuxiliaryBoundary,
     /// For `EncodedOracleBundle`, the basis extension degree must match the shape.
@@ -841,8 +967,54 @@ impl fmt::Display for BatchOpeningSpecError {
                     "batch-opening shape must use a non-zero extension degree"
                 )
             }
+            Self::RandomizerPayloadOverflow {
+                opening_points,
+                extension_degree,
+            } => write!(
+                f,
+                "batch-opening hidden randomizer payload count overflows usize: \
+                 opening_points ({opening_points}) * extension_degree ({extension_degree})"
+            ),
+            Self::RandomizerDegreeOverflow { relation_degree } => write!(
+                f,
+                "batch-opening default randomizer degree overflows usize: \
+                 relation_degree ({relation_degree}) + 1"
+            ),
             Self::DegreeBudget(err) => err.fmt(f),
             Self::Transcript(err) => err.fmt(f),
+            Self::PerfectRequiresClaim => write!(
+                f,
+                "perfect batch-opening specs must carry a validated PerfectClaim"
+            ),
+            Self::PerfectClaimOnStatisticalSpec => write!(
+                f,
+                "statistical batch-opening specs must not carry a PerfectClaim"
+            ),
+            Self::PerfectClaim(err) => err.fmt(f),
+            Self::PerfectClaimExtensionDegreeMismatch {
+                claim_degree,
+                shape_degree,
+            } => write!(
+                f,
+                "perfect batch-opening claim extension degree ({claim_degree}) does not match \
+                 the batch-opening shape extension degree ({shape_degree})"
+            ),
+            Self::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget,
+                required_query_budget,
+            } => write!(
+                f,
+                "perfect batch-opening claim query budget ({claim_query_budget}) does not cover \
+                 the required opening/query count ({required_query_budget})"
+            ),
+            Self::PerfectClaimFieldModelMismatch {
+                claim_field_model,
+                realization,
+            } => write!(
+                f,
+                "perfect batch-opening claim field model {claim_field_model:?} does not match \
+                 randomizer realization {realization:?}"
+            ),
             Self::PerfectVariantNeedsDedicatedAuxiliaryBoundary => write!(
                 f,
                 "perfect batch-opening variants must use a dedicated auxiliary commitment boundary"
@@ -874,6 +1046,12 @@ impl From<TranscriptPlanError> for BatchOpeningSpecError {
     }
 }
 
+impl From<PerfectClaimError> for BatchOpeningSpecError {
+    fn from(value: PerfectClaimError) -> Self {
+        Self::PerfectClaim(value)
+    }
+}
+
 #[cfg(test)]
 mod proptests {
     use super::{
@@ -881,7 +1059,22 @@ mod proptests {
         RandomizerOpeningPayload, ShroudBatchOpeningSpec,
     };
     use proptest::prelude::*;
-    use shroud_core::BasisDescriptor;
+    use shroud_core::{
+        BasisDescriptor, FieldModel, PerfectClaim, RandomnessModel, SimulatorObligations,
+    };
+
+    fn valid_perfect_claim(extension_degree: usize, query_budget: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::EncodedCoordinates {
+                basis: BasisDescriptor::plonky3_binomial(extension_degree),
+            },
+            query_budget,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid perfect claim")
+    }
 
     proptest! {
         #[test]
@@ -918,7 +1111,12 @@ mod proptests {
             let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
                 BasisDescriptor::plonky3_binomial(ext),
             );
-            let spec = ShroudBatchOpeningSpec::perfect(shape, relation, commitment)
+            let spec = ShroudBatchOpeningSpec::perfect(
+                shape,
+                relation,
+                commitment,
+                valid_perfect_claim(ext, points),
+            )
                 .expect("valid spec");
             match spec.randomizer_opening_payload() {
                 RandomizerOpeningPayload::Perfect(payload) => {
@@ -955,7 +1153,12 @@ mod proptests {
                 BasisDescriptor::plonky3_binomial(basis_ext),
             );
             prop_assert!(
-                ShroudBatchOpeningSpec::perfect(shape, relation, commitment).is_err()
+                ShroudBatchOpeningSpec::perfect(
+                    shape,
+                    relation,
+                    commitment,
+                    valid_perfect_claim(shape_ext, points),
+                ).is_err()
             );
         }
     }
@@ -968,7 +1171,34 @@ mod tests {
         PerfectHiddenOpeningPayload, PerfectRandomizerCommitment, PerfectRandomizerRealization,
         ProofSlotLayout, RandomizerOpeningPayload, RandomizerSpec, ShroudBatchOpeningSpec,
     };
-    use shroud_core::{BasisDescriptor, DegreeBudget, SecurityLevel};
+    use shroud_core::{
+        BasisDescriptor, DegreeBudget, FieldModel, PerfectClaim, RandomnessModel, SecurityLevel,
+        SimulatorObligations,
+    };
+
+    fn valid_perfect_claim(extension_degree: usize, query_budget: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::EncodedCoordinates {
+                basis: BasisDescriptor::plonky3_binomial(extension_degree),
+            },
+            query_budget,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid perfect claim")
+    }
+
+    fn valid_native_perfect_claim(extension_degree: usize, query_budget: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::NativeExtension { extension_degree },
+            query_budget,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid native perfect claim")
+    }
 
     #[test]
     fn statistical_spec_tracks_coordinate_polynomials_from_extension_degree() {
@@ -1005,12 +1235,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_randomizer_payload_overflow() {
+        assert_eq!(
+            BatchOpeningShape::new(1, usize::MAX, 2),
+            Err(BatchOpeningSpecError::RandomizerPayloadOverflow {
+                opening_points: usize::MAX,
+                extension_degree: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_default_randomizer_degree_overflow() {
+        let shape = BatchOpeningShape::new(1, 1, 1).expect("valid shape");
+        assert_eq!(
+            ShroudBatchOpeningSpec::statistical(shape, usize::MAX),
+            Err(BatchOpeningSpecError::RandomizerDegreeOverflow {
+                relation_degree: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
     fn perfect_spec_uses_dedicated_auxiliary_boundary() {
         let shape = BatchOpeningShape::new(6, 1, 2).expect("valid shape");
         let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
             BasisDescriptor::plonky3_binomial(2),
         );
-        let spec = ShroudBatchOpeningSpec::perfect(shape, 15, commitment).expect("valid spec");
+        let spec =
+            ShroudBatchOpeningSpec::perfect(shape, 15, commitment, valid_perfect_claim(2, 1))
+                .expect("valid spec");
 
         assert_eq!(spec.security_level(), SecurityLevel::Perfect);
         assert_eq!(
@@ -1054,12 +1308,77 @@ mod tests {
     }
 
     #[test]
+    fn perfect_claim_must_match_batch_extension_degree() {
+        let shape = BatchOpeningShape::new(6, 1, 4).expect("valid shape");
+        let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(4),
+        );
+
+        assert_eq!(
+            ShroudBatchOpeningSpec::perfect(shape, 15, commitment, valid_perfect_claim(1, 1)),
+            Err(BatchOpeningSpecError::PerfectClaimExtensionDegreeMismatch {
+                claim_degree: 1,
+                shape_degree: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn perfect_claim_query_budget_must_cover_opening_points() {
+        let shape = BatchOpeningShape::new(6, 3, 4).expect("valid shape");
+        let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(4),
+        );
+
+        assert_eq!(
+            ShroudBatchOpeningSpec::perfect(shape, 15, commitment, valid_perfect_claim(4, 1)),
+            Err(BatchOpeningSpecError::PerfectClaimQueryBudgetTooSmall {
+                claim_query_budget: 1,
+                required_query_budget: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn encoded_bundle_requires_encoded_coordinates_claim() {
+        let shape = BatchOpeningShape::new(6, 1, 4).expect("valid shape");
+        let commitment = PerfectRandomizerCommitment::encoded_oracle_bundle(
+            BasisDescriptor::plonky3_binomial(4),
+        );
+        let claim = valid_native_perfect_claim(4, 1);
+
+        assert_eq!(
+            ShroudBatchOpeningSpec::perfect(shape, 15, commitment, claim),
+            Err(BatchOpeningSpecError::PerfectClaimFieldModelMismatch {
+                claim_field_model: claim.field_model,
+                realization: commitment.realization(),
+            })
+        );
+    }
+
+    #[test]
+    fn native_extension_requires_native_extension_claim() {
+        let shape = BatchOpeningShape::new(6, 1, 4).expect("valid shape");
+        let commitment = PerfectRandomizerCommitment::native_extension_pcs();
+        let claim = valid_perfect_claim(4, 1);
+
+        assert_eq!(
+            ShroudBatchOpeningSpec::perfect(shape, 15, commitment, claim),
+            Err(BatchOpeningSpecError::PerfectClaimFieldModelMismatch {
+                claim_field_model: claim.field_model,
+                realization: commitment.realization(),
+            })
+        );
+    }
+
+    #[test]
     fn native_extension_perfect_randomizer_needs_dedicated_slot_shape() {
         let shape = BatchOpeningShape::new(3, 2, 4).expect("valid shape");
         let spec = ShroudBatchOpeningSpec::perfect(
             shape,
             31,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim(4, 2),
         )
         .expect("valid spec");
 
@@ -1101,6 +1420,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 2,
             )),
+            valid_perfect_claim(2, 1),
         )
         .expect("valid spec");
 
@@ -1118,6 +1438,7 @@ mod tests {
                 PerfectRandomizerCommitment::encoded_oracle_bundle(
                     BasisDescriptor::plonky3_binomial(2),
                 ),
+                valid_perfect_claim(4, 1),
             ),
             Err(BatchOpeningSpecError::InconsistentEncodedBundleDegree {
                 shape_degree: 4,

@@ -20,9 +20,10 @@ use shroud_batch_opening::{
 };
 use shroud_codeword_embedding::ShroudCodewordEmbeddingSpec;
 use shroud_core::{
-    AuxiliaryTransport, BasisDescriptor, DOMAIN_PROFILE, DOMAIN_RANDOMIZER_COMMITMENT,
-    HashIdentifier, HidingTechniqueClaim, SampledChallenge, TranscriptBindable, TranscriptBinding,
-    TranscriptBindingError, TranscriptBindingManifest, TranscriptChallengeDeriver, TranscriptStage,
+    AuxiliaryTransport, BasisDescriptor, CanonicalBatchOpeningManifest, DOMAIN_PROFILE,
+    DOMAIN_RANDOMIZER_COMMITMENT, HashIdentifier, HidingTechniqueClaim, SampledChallenge,
+    TranscriptBindable, TranscriptBinding, TranscriptBindingError, TranscriptBindingManifest,
+    TranscriptBindingSource, TranscriptChallengeDeriver, TranscriptStage,
     transcript_stage_discriminant,
 };
 use shroud_opening_projection::{AuxiliaryOpeningTransport, ShroudOpeningProjectionSpec};
@@ -90,7 +91,11 @@ impl<'a> ReferenceTranscript<'a> {
                 {
                     let domain_label = match e {
                         TranscriptBindingError::MissingBinding { domain_label }
-                        | TranscriptBindingError::BindingMismatch { domain_label } => domain_label,
+                        | TranscriptBindingError::BindingMismatch { domain_label }
+                        | TranscriptBindingError::PlaceholderBinding { domain_label }
+                        | TranscriptBindingError::BindingSourceMismatch { domain_label, .. } => {
+                            domain_label
+                        }
                     };
                     return Err(ReferenceTranscriptError::MissingBindingBeforeStage {
                         stage,
@@ -329,6 +334,7 @@ impl std::error::Error for ReferenceTranscriptError {}
 #[derive(Debug, Default)]
 pub struct ReferenceBindingRecord {
     absorbed: Vec<TranscriptBinding>,
+    sources: Vec<TranscriptBindingSource>,
 }
 
 impl ReferenceBindingRecord {
@@ -337,17 +343,47 @@ impl ReferenceBindingRecord {
     pub fn new() -> Self {
         Self {
             absorbed: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
-    /// Absorbs a raw transcript binding into the record.
+    /// Absorbs a raw transcript binding into the record as declared data.
     pub fn absorb(&mut self, binding: TranscriptBinding) {
-        self.absorbed.push(binding);
+        self.absorb_with_source(binding, TranscriptBindingSource::Declared);
     }
 
-    /// Absorbs the canonical binding for a [`TranscriptBindable`] protocol object.
+    /// Absorbs a raw transcript binding with explicit provenance.
+    pub fn absorb_with_source(
+        &mut self,
+        binding: TranscriptBinding,
+        source: TranscriptBindingSource,
+    ) {
+        self.absorbed.push(binding);
+        self.sources.push(source);
+    }
+
+    /// Absorbs a binding derived from a live backend transcript event.
+    pub fn absorb_live(&mut self, binding: TranscriptBinding) {
+        self.absorb_with_source(binding, TranscriptBindingSource::Live);
+    }
+
+    /// Absorbs a deliberate placeholder binding.
+    pub fn absorb_placeholder(&mut self, binding: TranscriptBinding) {
+        self.absorb_with_source(binding, TranscriptBindingSource::Placeholder);
+    }
+
+    /// Absorbs the canonical binding for a declared [`TranscriptBindable`] protocol object.
     pub fn absorb_bindable<T: TranscriptBindable>(&mut self, value: &T) {
         self.absorb(value.to_transcript_binding());
+    }
+
+    /// Absorbs the canonical binding for a [`TranscriptBindable`] with explicit provenance.
+    pub fn absorb_bindable_with_source<T: TranscriptBindable>(
+        &mut self,
+        value: &T,
+        source: TranscriptBindingSource,
+    ) {
+        self.absorb_with_source(value.to_transcript_binding(), source);
     }
 
     /// Returns `true` if a binding with the given domain label was absorbed.
@@ -367,10 +403,67 @@ impl ReferenceBindingRecord {
         })
     }
 
+    /// Returns `true` if an exact binding was absorbed with the given provenance.
+    #[must_use]
+    pub fn contains_exact_binding_from_source(
+        &self,
+        expected: &TranscriptBinding,
+        source: TranscriptBindingSource,
+    ) -> bool {
+        self.absorbed.iter().enumerate().any(|(index, b)| {
+            b.domain_label() == expected.domain_label()
+                && b.canonical_bytes() == expected.canonical_bytes()
+                && self.source_at(index) == source
+        })
+    }
+
     /// Returns all absorbed bindings in absorption order.
     #[must_use]
     pub fn absorbed(&self) -> &[TranscriptBinding] {
         &self.absorbed
+    }
+
+    /// Returns the provenance source for an absorbed binding by index.
+    ///
+    /// Records created before source tracking, or test-only direct mutations of
+    /// the internal binding vector, are treated as declared data.
+    #[must_use]
+    pub fn source_at(&self, index: usize) -> TranscriptBindingSource {
+        self.sources
+            .get(index)
+            .copied()
+            .unwrap_or(TranscriptBindingSource::Declared)
+    }
+
+    /// Returns absorbed bindings paired with their provenance.
+    #[must_use]
+    pub fn absorbed_with_sources(&self) -> Vec<(&TranscriptBinding, TranscriptBindingSource)> {
+        self.absorbed
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| (binding, self.source_at(index)))
+            .collect()
+    }
+
+    /// Returns `true` if any absorbed binding is marked as a placeholder.
+    #[must_use]
+    pub fn contains_placeholder_binding(&self) -> bool {
+        self.absorbed
+            .iter()
+            .enumerate()
+            .any(|(index, _)| self.source_at(index).is_placeholder())
+    }
+
+    /// Rejects records containing placeholder bindings.
+    pub fn assert_no_placeholder_bindings(&self) -> Result<(), TranscriptBindingError> {
+        for (index, binding) in self.absorbed.iter().enumerate() {
+            if self.source_at(index).is_placeholder() {
+                return Err(TranscriptBindingError::PlaceholderBinding {
+                    domain_label: binding.domain_label().to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Checks that every label in `required_labels` was absorbed.
@@ -415,6 +508,38 @@ impl ReferenceBindingRecord {
         Ok(())
     }
 
+    /// Checks that every binding in `expected` was absorbed with exact bytes and provenance.
+    pub fn assert_exact_present_from_source(
+        &self,
+        expected: &[TranscriptBinding],
+        source: TranscriptBindingSource,
+    ) -> Result<(), TranscriptBindingError> {
+        for binding in expected {
+            if self.contains_exact_binding_from_source(binding, source) {
+                continue;
+            }
+            if let Some((index, _)) = self.absorbed.iter().enumerate().find(|(_, absorbed)| {
+                absorbed.domain_label() == binding.domain_label()
+                    && absorbed.canonical_bytes() == binding.canonical_bytes()
+            }) {
+                return Err(TranscriptBindingError::BindingSourceMismatch {
+                    domain_label: binding.domain_label().to_string(),
+                    expected_source: source,
+                    actual_source: self.source_at(index),
+                });
+            }
+            if self.contains_binding(binding.domain_label()) {
+                return Err(TranscriptBindingError::BindingMismatch {
+                    domain_label: binding.domain_label().to_string(),
+                });
+            }
+            return Err(TranscriptBindingError::MissingBinding {
+                domain_label: binding.domain_label().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Verifies that every expected binding declared by the manifest was absorbed
     /// with the exact canonical bytes.
     ///
@@ -438,6 +563,14 @@ impl ReferenceBindingRecord {
             self.assert_exact_present(manifest.required_before(stage))?;
         }
         Ok(())
+    }
+
+    /// Verifies the record against the reviewed canonical batch-opening manifest.
+    pub fn finalize_canonical(
+        &self,
+        manifest: &CanonicalBatchOpeningManifest,
+    ) -> Result<(), TranscriptBindingError> {
+        self.finalize(manifest.as_manifest())
     }
 }
 
@@ -2478,10 +2611,11 @@ mod tests {
     };
     use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
     use shroud_core::{
-        AuxiliaryTransport, BasisDescriptor, DOMAIN_BASIS, DOMAIN_DEGREE_CONTRACT,
-        DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS,
-        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, HashIdentifier, PublicOpeningBinding,
-        SecurityLevel, StandardBatchOpeningBindings, TranscriptBindable, TranscriptBinding,
+        AuxiliaryTransport, BasisDescriptor, CanonicalBatchOpeningManifest, DOMAIN_BASIS,
+        DOMAIN_DEGREE_CONTRACT, DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS,
+        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, FieldModel, HashIdentifier,
+        PerfectClaim, PublicOpeningBinding, RandomnessModel, SecurityLevel, SimulatorObligations,
+        StandardBatchOpeningBindings, TranscriptBindable, TranscriptBinding,
         TranscriptBindingError, TranscriptBindingManifest, TranscriptStage,
     };
     use shroud_opening_projection::{
@@ -2494,6 +2628,34 @@ mod tests {
         QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
         QuotientHiderShape, ShroudQuotientHiderSpec,
     };
+
+    fn valid_perfect_claim() -> PerfectClaim {
+        valid_perfect_claim_for_degree(4)
+    }
+
+    fn valid_perfect_claim_for_degree(extension_degree: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::EncodedCoordinates {
+                basis: BasisDescriptor::plonky3_binomial(extension_degree),
+            },
+            64,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid perfect claim")
+    }
+
+    fn valid_native_perfect_claim_for_degree(extension_degree: usize) -> PerfectClaim {
+        PerfectClaim::new(
+            RandomnessModel::UniformPerProof,
+            FieldModel::NativeExtension { extension_degree },
+            64,
+            SimulatorObligations::HonestVerifierChallengeAccess,
+            true,
+        )
+        .expect("valid native perfect claim")
+    }
 
     #[test]
     fn accepts_the_standard_statistical_flow() {
@@ -2519,6 +2681,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 2,
             )),
+            valid_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
@@ -2551,6 +2714,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 2,
             )),
+            valid_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let mut transcript = ReferenceTranscript::new(&spec, TranscriptBindingManifest::new());
@@ -2588,6 +2752,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 3,
             )),
+            valid_perfect_claim_for_degree(3),
         )
         .expect("valid spec");
         let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle(
@@ -2648,6 +2813,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let backend = ReferencePerfectRandomizerBackend::native_extension_pcs();
@@ -2678,6 +2844,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let backend = ReferencePerfectRandomizerBackend::encoded_oracle_bundle(
@@ -2704,6 +2871,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 3,
             )),
+            valid_perfect_claim_for_degree(3),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2739,6 +2907,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2794,6 +2963,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2841,6 +3011,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 2,
             )),
+            valid_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2867,6 +3038,7 @@ mod tests {
             shape,
             15,
             PerfectRandomizerCommitment::native_extension_pcs(),
+            valid_native_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2892,6 +3064,7 @@ mod tests {
             PerfectRandomizerCommitment::encoded_oracle_bundle(BasisDescriptor::plonky3_binomial(
                 2,
             )),
+            valid_perfect_claim_for_degree(2),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -2943,6 +3116,7 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -2963,6 +3137,7 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -3015,6 +3190,7 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3035,6 +3211,7 @@ mod tests {
         let spec = ShroudOpeningProjectionSpec::perfect(
             shape,
             AuxiliaryOpeningTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3091,6 +3268,7 @@ mod tests {
         let spec = ShroudOracleCommitmentSpec::perfect(
             shape,
             OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -3111,6 +3289,7 @@ mod tests {
         let spec = ShroudOracleCommitmentSpec::perfect(
             shape,
             OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -3169,6 +3348,7 @@ mod tests {
         let spec = ShroudOracleCommitmentSpec::perfect(
             shape,
             OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3189,6 +3369,7 @@ mod tests {
         let spec = ShroudOracleCommitmentSpec::perfect(
             shape,
             OracleAuxiliaryTransport::SeparateAuxiliaryProof,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3262,6 +3443,7 @@ mod tests {
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
             None,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -3285,6 +3467,7 @@ mod tests {
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
             None,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferencePlonky3Adapter;
@@ -3352,6 +3535,7 @@ mod tests {
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
             None,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3375,6 +3559,7 @@ mod tests {
             shape,
             QuotientAuxiliaryTransport::SeparateAuxiliaryProof,
             None,
+            valid_perfect_claim(),
         )
         .expect("valid spec");
         let adapter = ReferenceLayeredAdapter;
@@ -3714,6 +3899,7 @@ mod tests {
             batch_shape,
             15,
             PerfectRandomizerCommitment::encoded_oracle_bundle(basis),
+            valid_perfect_claim(),
         )
         .expect("valid batch spec");
         let codeword_shape =
@@ -3767,7 +3953,7 @@ mod tests {
 
     fn standard_manifest_from_fixture(
         fixture: &StandardManifestFixture,
-    ) -> TranscriptBindingManifest {
+    ) -> CanonicalBatchOpeningManifest {
         TranscriptBindingManifest::standard_for_batch_opening(
             StandardBatchOpeningBindings::from_bindables(
                 &fixture.hash_identifier,
@@ -3788,7 +3974,7 @@ mod tests {
 
     fn build_complete_finalize_state() -> (TranscriptBindingManifest, ReferenceBindingRecord) {
         let fixture = standard_manifest_fixture();
-        let manifest = standard_manifest_from_fixture(&fixture);
+        let manifest = standard_manifest_from_fixture(&fixture).into_inner();
 
         let mut record = ReferenceBindingRecord::new();
         record.absorb_bindable(&fixture.hash_identifier);
@@ -4053,7 +4239,7 @@ mod tests {
         record.absorb_bindable(&fixture.public_openings);
 
         assert_eq!(
-            record.finalize(&manifest),
+            record.finalize_canonical(&manifest),
             Err(TranscriptBindingError::BindingMismatch {
                 domain_label: DOMAIN_ORACLE_COMMITMENT.to_string(),
             })
@@ -4223,7 +4409,7 @@ mod tests {
     fn finish_requires_recorded_sampling_challenges() {
         let fixture = standard_manifest_fixture();
         let manifest = standard_manifest_from_fixture(&fixture);
-        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest.into_inner());
         transcript
             .record_mut()
             .absorb_bindable(&fixture.hash_identifier);
@@ -4271,7 +4457,7 @@ mod tests {
     fn finish_replays_recorded_challenges() {
         let fixture = standard_manifest_fixture();
         let manifest = standard_manifest_from_fixture(&fixture);
-        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest.into_inner());
         transcript
             .record_mut()
             .absorb_bindable(&fixture.hash_identifier);
@@ -4332,7 +4518,7 @@ mod tests {
     fn replay_rejects_wrong_hash_identifier() {
         let fixture = standard_manifest_fixture();
         let manifest = standard_manifest_from_fixture(&fixture);
-        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest);
+        let mut transcript = ReferenceTranscript::new(&fixture.batch_spec, manifest.into_inner());
         transcript
             .record_mut()
             .absorb_bindable(&fixture.hash_identifier);
