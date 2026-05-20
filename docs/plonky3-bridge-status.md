@@ -48,6 +48,48 @@ The bridge validates the **pre-grind portion** of a live `HidingFriPcs` transcri
 9. `randomizer_commit` — always present, bridge is ZK-only (line 286)
 10. ζ (`SampleOodPoint`) (line 300)
 
+**Lean grammar.** The supported pre-grind boundary is modeled in
+`formal/Shroud/Bridge/Plonky3/PreGrind.lean`:
+
+- `mandatoryPreGrindEvents_mem` proves every mandatory pre-grind slot appears in every shape-specific grammar.
+- `mandatoryObservedPreGrindEvents_are_observed`, `sampledPreGrindEvents_are_sampled`, and `observedPreGrindEvents_are_observed` separate byte-block events from α/ζ sampled challenge events.
+- `preGrindGrammar_contains_only_liveEventKinds` proves every event in the live grammar is either an observed byte block or a sampled challenge.
+- `preprocessedCommitment_mem_iff` and `airPublicValues_mem_iff` model the two optional slots.
+- `randomizerCommitment_before_sampleOodPoint` proves event 9 precedes ζ for every supported shape.
+- `preGrindGrammar_contains_no_postZetaPlaceholders` proves opened values and FRI envelope slots are outside live pre-grind extraction.
+
+Lean treats `airPublicValues` as absent when the recorder emits no bytes. Rust still includes
+`DOMAIN_PLONKY3_AIR_PUBLIC_VALUES` in the manifest/record as an empty binding so exact-byte
+finalization remains shape-stable; this is a representation distinction, not a live-coverage claim.
+Similarly, Lean models α and ζ as logical sample slots; Rust owns byte-level fragmentation and may
+record one logical challenge as one or more contiguous `Sampled` events.
+
+**Extractor error mapping.**
+
+| Rust extractor error | Grammar meaning |
+|---|---|
+| `TruncatedLog` | The recorder ended before the next required grammar slot was fully observed. |
+| `SampledInObserveBlock` | A challenge sample appeared while the grammar expected an observed byte block. |
+| `ObservedBlockOvershoot` | An observed byte block crossed the fixed boundary of the current grammar slot. |
+| `MissingChallengeSample` | The grammar expected α or ζ, but no sampled challenge event was present. |
+
+`SampledInObserveBlock` and `ObservedBlockOvershoot` are errors against slots proven by
+`observedPreGrindEvents_are_observed`; `MissingChallengeSample` is an error against slots proven
+by `sampledPreGrindEvents_are_sampled`.
+
+**Lean claim-preservation layer.** The audit-layer thesis ("SHROUD preserves, does not strengthen, the backend claim") is formalized in `formal/Shroud/Core/Conformance.lean`:
+
+- `ClaimScope` enumerates supported claim scopes (`coreBatchOpening`, `plonky3UniStarkPreGrind`, `plonky3FullFriReplay`, `whirHvzk`); the current bridge's intended scope is `plonky3UniStarkPreGrind`.
+- `ClaimScope.requiresFullLive` distinguishes scopes that admit placeholder bindings (`plonky3UniStarkPreGrind`, `coreBatchOpening`) from scopes that do not (`plonky3FullFriReplay`, `whirHvzk`).
+- `BackendClaim` carries the declared scope, security level, and an inspectable list of `UpstreamCitation` tags (BCS-IOP, DEEP-FRI, Haböck-Kindi, HVZK-WHIR, etc.) — making the upstream theorem dependencies visible without re-proving them.
+- `ShroudChecks (scope)` is phantom-parameterized by scope so two different scope's check bundles have distinct types — a typed firewall against passing the wrong scope's checks.
+- `shroudAccept` wraps a `BackendClaim` with a `BackendConforms` witness, producing an `AcceptedClaim` whose projections preserve the backend's scope (`accept_preserves_scope`), security level (`accept_preserves_securityLevel`), and citations (`accept_preserves_citations`).
+- `accept_does_not_strengthen` is the headline theorem: SHROUD acceptance preserves scope and security level exactly.
+- `sourceAcceptableForScope scope source` is the scope-indexed predicate that distinguishes which `BindingSource`s a given scope admits.
+- `placeholderSource_incompatible_with_fullLive_scope (scope) (h : scope.requiresFullLive = true) : sourceAcceptableForScope scope .placeholder = false` is the scope-aware audit-layer thesis: any full-live scope rejects placeholder bindings. Corollaries `placeholderSource_incompatible_with_plonky3FullFriReplay` and `placeholderSource_incompatible_with_whirHvzk` apply this to the two currently-named full-live scopes; `placeholderSource_acceptable_for_plonky3UniStarkPreGrind` is its positive complement for the current Plonky3 scope.
+
+The Rust conformance fixture `current_plonky3_input_is_not_full_live_capable` in `crates/shroud-conformance/src/lib.rs` provides executable evidence: a standard `Plonky3LiveHarnessInput` carries at least one `TranscriptBindingSource::Placeholder` binding (specifically `DOMAIN_PLONKY3_OPENED_VALUES`). By composition with `placeholderSource_incompatible_with_fullLive_scope`, every full-live scope (`plonky3FullFriReplay`, `whirHvzk`) is excluded. The fixture does NOT also assert the scope is specifically `plonky3UniStarkPreGrind` — that requires a Rust `ClaimScope` enum (Phase C) plus a scoped-claim builder.
+
 ---
 
 ## What is intentionally placeholder
@@ -77,6 +119,18 @@ Field on `Plonky3LiveHarnessConfig` | Manifest slot | Why placeholder
 2. **Upstream grind patch** — change `SerializingChallenger32::grind` to spawn fresh challenger copies (`Arc::clone` of the inner challenger only, not the tape) for sub-search workers. Cleanest fix, but requires an upstream merge.
 
 Either path closes the gap to full PCS-internal replay: live `opened_values`, live FRI commit-phase commitments, final poly, and log arities. Until then, the binding-layer claim stops at ζ.
+
+---
+
+## Scope decision
+
+The current Lean grammar and conformance fixtures are intentionally limited to the uni-stark pre-grind boundary described above. Do not extend the formal grammar to batch-stark rows or post-zeta PCS/FRI events until the recorder can produce clean live bytes for that region.
+
+For now:
+
+- **Formalized:** uni-stark rows 1-10, including optional preprocessed commitment and optional AIR public values.
+- **Conformance-covered:** all four optional-shape extractor cases, plus logical α/ζ sample slots represented by one or more byte-level `Sampled` events.
+- **Deferred:** batch-stark grammar, opened values at ζ, FRI commit-phase commitments, final polynomial, log arities, PoW grind, and query openings.
 
 ---
 

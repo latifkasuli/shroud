@@ -137,6 +137,11 @@ pub struct OracleCommitmentPayload {
 
 impl OracleCommitmentPayload {
     /// Builds an oracle-commitment payload from a validated shape.
+    ///
+    /// Lean theorems: `OracleCommitmentPayload.fromShape_publicCommitments`,
+    /// `OracleCommitmentPayload.fromShape_publicRowValues`,
+    /// `OracleCommitmentPayload.fromShape_publicAuthenticationItems`, and
+    /// `OracleCommitmentPayload.fromShape_hiddenHidingWitnessItems`.
     #[must_use]
     pub const fn new(
         shape: OracleCommitmentShape,

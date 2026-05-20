@@ -92,6 +92,10 @@ pub struct OpeningProjectionPayload {
 
 impl OpeningProjectionPayload {
     /// Builds a projection payload from a validated shape.
+    ///
+    /// Lean theorems: `OpeningProjectionPayload.fromShape_publicOpeningValues`,
+    /// `OpeningProjectionPayload.fromShape_hiddenAuxiliaryValues`, and
+    /// `OpeningProjectionPayload.fromShape_verifierReconstructionItems`.
     #[must_use]
     pub const fn new(
         shape: OpeningProjectionShape,

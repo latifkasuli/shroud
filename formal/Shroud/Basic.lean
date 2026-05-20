@@ -1,4 +1,6 @@
+import Shroud.Bridge.Plonky3.PreGrind
 import Shroud.Core.Binding
+import Shroud.Core.Conformance
 import Shroud.Core.Degree
 import Shroud.Core.Security
 import Shroud.Core.Transcript

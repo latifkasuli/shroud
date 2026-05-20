@@ -871,6 +871,7 @@ Current implementation notes:
 - The Plonky3 pre-grind harness marks extracted pre-zeta slots as live and deferred post-zeta slots as placeholders; `Plonky3ReplayHarness::verify_full_live` rejects placeholders and requires manifest-covered backend event slots to be sourced as live.
 - `CanonicalBatchOpeningManifest` wraps the reviewed SHROUD v1 batch-opening manifest, separating the complete standard path from bespoke `TranscriptBindingManifest::new()` planning/test manifests.
 - `shroud-conformance` carries fixed Rust fixtures for the first Lean/Rust drift surfaces: canonical manifest stage buckets, complete canonical record finalization, codeword payload accounting, batch-opening statistical/perfect payload accounting, perfect-claim field-model matching, quotient degree/payload accounting, oracle/projection payload accounting, and Plonky3 pre-grind binding-source provenance.
+- Rust protocol-law comments now name the Lean theorem sites for `TranscriptPlan`, `DegreeBudget`, quotient degree contracts, and first-pass payload-accounting formulas.
 
 ### Phase 6: Formalize Plonky3 Pre-Grind Boundary
 
@@ -888,6 +889,31 @@ Exit criteria:
 
 - `docs/plonky3-bridge-status.md` can cite Lean grammar theorem names;
 - no one can confuse pre-grind support with full FRI replay support.
+
+Current Lean theorem names:
+
+- `mandatoryPreGrindEvents_mem`;
+- `mandatoryObservedPreGrindEvents_are_observed`;
+- `sampledPreGrindEvents_are_sampled`;
+- `observedPreGrindEvents_are_observed`;
+- `preGrindGrammar_contains_only_liveEventKinds`;
+- `postZetaPlaceholderEvents_not_livePreGrind`;
+- `preprocessedCommitment_mem_iff`;
+- `airPublicValues_mem_iff`;
+- `randomizerCommitment_before_sampleOodPoint`;
+- `preGrindGrammar_contains_no_postZetaPlaceholders`;
+- `standard_randomizerCommitment_before_sampleOodPoint`.
+
+Current implementation notes:
+
+- `formal/Shroud/Bridge/Plonky3/PreGrind.lean` models the current uni-stark pre-grind event grammar.
+- `PreGrindShape` captures the optional preprocessed-commitment and AIR-public-values slots.
+- `isObservedBlock`, `isSampledChallenge`, and `isLivePreGrindEvent` separate Rust's `read_observed_block` path from the α/ζ `read_sampled_block` path.
+- Post-zeta opened values and FRI envelope events are present as named `TranscriptEvent` constructors but proved absent from `preGrindGrammar`.
+- Lean models α and ζ as logical sample slots; Rust owns byte-level `Sampled` event fragmentation and fixed byte-block sizes.
+- `shroud-conformance` now exercises optional preprocessed-commitment and AIR-public-values extractor shapes, including split byte-level `Sampled` events for one logical Lean sample slot.
+- `docs/plonky3-bridge-status.md` maps `LiveExtractionError` variants to grammar failure classes.
+- Phase 6 is intentionally frozen at the current uni-stark pre-grind boundary until the post-zeta recorder gap is solved; batch-stark grammar is a separate future extension.
 
 ### Phase 7: WHIR/HVZK Extension
 
@@ -1098,10 +1124,13 @@ Completed:
 18. Prove initial oracle-commitment, quotient-hider, and opening-projection payload-accounting laws.
 19. Tighten Rust oracle-commitment and quotient-hider constructors to reject finite-machine overflow for the exact payload arithmetic modeled in Lean.
 20. Start Phase 5 by requiring `PerfectClaim` in Rust perfect constructors and embedding the claim in perfect object transcript bindings.
+21. Add Rust comments linking `TranscriptPlan`, `DegreeBudget`, quotient degree contracts, and payload-accounting formulas to Lean theorem names.
+22. Start Phase 6 by adding the Plonky3 pre-grind event grammar in Lean and citing its theorem names from `docs/plonky3-bridge-status.md`.
+23. Add Rust conformance fixtures for the Phase 6 optional-shape extractor boundary.
 
 Next:
 
-1. Add Rust comments linking `TranscriptPlan`, `DegreeBudget`, quotient degree contracts, and payload-accounting formulas to Lean theorem names.
+1. Keep the Phase 6 grammar frozen at uni-stark pre-grind while post-zeta recording remains blocked.
 
 This sequence gives SHROUD immediate formal value without disrupting the Plonky3 bridge work.
 

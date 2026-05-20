@@ -22,7 +22,7 @@
 //!   any prover-controlled byte enters the transcript.
 //! - **(b) Plonky3 transcript-order events** —
 //!   `log_ext_degree, log_degree, preprocessed_width,
-//!   [preprocessed_commit], trace_commit, air_public_values,
+//!   trace_commit, [preprocessed_commit], air_public_values,
 //!   quotient_commit, randomizer_commit (between QUOTIENT and ζ),
 //!   opened_values, fri_*`.
 //! - `public_openings` absorbed at the tail as a SHROUD-canonical

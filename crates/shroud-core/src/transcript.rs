@@ -55,6 +55,11 @@ impl fmt::Display for TranscriptStage {
 }
 
 /// Canonical transcript schedule for a SHROUD batch-opening object.
+///
+/// Lean mirror: `canonicalBatchOpeningSchedule` in
+/// `formal/Shroud/Core/Transcript.lean`. In particular,
+/// `randomizerCommitment_before_ood` proves the concrete schedule places
+/// `ObserveRandomizerCommitment` before `SampleOodPoint`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptPlan {
     stages: Vec<TranscriptStage>,
@@ -62,6 +67,8 @@ pub struct TranscriptPlan {
 
 impl TranscriptPlan {
     /// Returns the canonical SHROUD ZK batch-opening transcript order.
+    ///
+    /// Keep this list synchronized with Lean's `canonicalBatchOpeningSchedule`.
     #[must_use]
     pub fn standard_batch_opening() -> Self {
         Self {

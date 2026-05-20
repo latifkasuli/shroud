@@ -32,12 +32,13 @@ mod tests {
         OracleAuxiliaryTransport, OracleCommitmentShape, ShroudOracleCommitmentSpec,
     };
     use shroud_plonky3::{
-        DOMAIN_PLONKY3_AIR_PUBLIC_VALUES, DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS,
-        DOMAIN_PLONKY3_FRI_FINAL_POLY, DOMAIN_PLONKY3_FRI_LOG_ARITIES, DOMAIN_PLONKY3_LOG_DEGREE,
-        DOMAIN_PLONKY3_LOG_EXT_DEGREE, DOMAIN_PLONKY3_OPENED_VALUES,
-        DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT, DOMAIN_PLONKY3_PREPROCESSED_WIDTH,
-        DOMAIN_PLONKY3_QUOTIENT_COMMITMENT, DOMAIN_PLONKY3_TRACE_COMMITMENT,
-        LivePreGrindExtraction, Plonky3LiveHarnessConfig, build_pre_grind_harness_input,
+        ByteTranscriptEvent, DOMAIN_PLONKY3_AIR_PUBLIC_VALUES,
+        DOMAIN_PLONKY3_FRI_COMMIT_PHASE_COMMITMENTS, DOMAIN_PLONKY3_FRI_FINAL_POLY,
+        DOMAIN_PLONKY3_FRI_LOG_ARITIES, DOMAIN_PLONKY3_LOG_DEGREE, DOMAIN_PLONKY3_LOG_EXT_DEGREE,
+        DOMAIN_PLONKY3_OPENED_VALUES, DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT,
+        DOMAIN_PLONKY3_PREPROCESSED_WIDTH, DOMAIN_PLONKY3_QUOTIENT_COMMITMENT,
+        DOMAIN_PLONKY3_TRACE_COMMITMENT, LiveExtractorShape, LivePreGrindExtraction,
+        Plonky3LiveHarnessConfig, build_pre_grind_harness_input, extract_pre_grind_slices,
     };
     use shroud_quotient_hider::{
         QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
@@ -132,6 +133,84 @@ mod tests {
             )),
             public_openings: PublicOpeningBinding::new(vec![0xC0; 16]),
         }
+    }
+
+    fn observed(byte: u8, len: usize) -> ByteTranscriptEvent {
+        ByteTranscriptEvent::Observed(vec![byte; len])
+    }
+
+    fn sampled(byte: u8, len: usize) -> ByteTranscriptEvent {
+        ByteTranscriptEvent::Sampled(vec![byte; len])
+    }
+
+    fn pre_grind_events(
+        has_preprocessed_commitment: bool,
+        air_public_values_bytes: usize,
+        split_samples: bool,
+    ) -> Vec<ByteTranscriptEvent> {
+        let mut events = vec![
+            observed(0x01, 4),
+            observed(0x02, 4),
+            observed(0x03, 4),
+            observed(0x04, 32),
+        ];
+        if has_preprocessed_commitment {
+            events.push(observed(0x05, 32));
+        }
+        if air_public_values_bytes > 0 {
+            events.push(observed(0x06, air_public_values_bytes));
+        }
+        if split_samples {
+            events.push(sampled(0xA0, 16));
+            events.push(sampled(0xA1, 16));
+        } else {
+            events.push(sampled(0xA0, 32));
+        }
+        events.push(observed(0x08, 32));
+        events.push(observed(0x09, 32));
+        if split_samples {
+            events.push(sampled(0xB0, 8));
+            events.push(sampled(0xB1, 8));
+        } else {
+            events.push(sampled(0xB0, 16));
+        }
+        events
+    }
+
+    fn assert_pre_grind_extraction_shape(
+        has_preprocessed_commitment: bool,
+        air_public_values_bytes: usize,
+        split_samples: bool,
+    ) {
+        let shape = LiveExtractorShape {
+            preprocessed_commit_bytes: has_preprocessed_commitment.then_some(32),
+            air_public_values_bytes,
+            ..LiveExtractorShape::standard()
+        };
+        let extraction = extract_pre_grind_slices(
+            &pre_grind_events(
+                has_preprocessed_commitment,
+                air_public_values_bytes,
+                split_samples,
+            ),
+            &shape,
+        )
+        .expect("shape-specific pre-grind extraction must succeed");
+
+        assert_eq!(extraction.log_ext_degree, vec![0x01; 4]);
+        assert_eq!(extraction.log_degree, vec![0x02; 4]);
+        assert_eq!(extraction.preprocessed_width, vec![0x03; 4]);
+        assert_eq!(extraction.trace_commit, vec![0x04; 32]);
+        assert_eq!(
+            extraction.preprocessed_commit,
+            has_preprocessed_commitment.then(|| vec![0x05; 32])
+        );
+        assert_eq!(
+            extraction.air_public_values,
+            vec![0x06; air_public_values_bytes]
+        );
+        assert_eq!(extraction.quotient_commit, vec![0x08; 32]);
+        assert_eq!(extraction.randomizer_commit, vec![0x09; 32]);
     }
 
     fn canonical_manifest_fixture() -> (shroud_core::CanonicalBatchOpeningManifest, StandardFixture)
@@ -507,5 +586,124 @@ mod tests {
         ] {
             assert_eq!(source_for(label), TranscriptBindingSource::Placeholder);
         }
+    }
+
+    #[test]
+    fn plonky3_pre_grind_extractor_shape_fixtures_match_lean_event_kinds() {
+        // Mirrors `preprocessedCommitment_mem_iff`,
+        // `airPublicValues_mem_iff`, `observedPreGrindEvents_are_observed`,
+        // and `sampledPreGrindEvents_are_sampled`.
+        //
+        // Lean models alpha/zeta as logical sample slots; Rust may record one
+        // logical sample slot as multiple contiguous byte-level Sampled events.
+        assert_pre_grind_extraction_shape(false, 0, false);
+        assert_pre_grind_extraction_shape(true, 0, false);
+        assert_pre_grind_extraction_shape(false, 8, false);
+        assert_pre_grind_extraction_shape(true, 8, true);
+    }
+
+    #[test]
+    fn current_plonky3_input_is_not_full_live_capable() {
+        // Phase A conformance (P2-2 corrected): the current `shroud-plonky3`
+        // bridge produces inputs that CANNOT carry any full-live claim scope.
+        // It does NOT also prove the accepted scope is specifically
+        // `plonky3UniStarkPreGrind` — that requires a Rust `ClaimScope` enum
+        // (deferred to Phase C) plus a scoped-claim builder. For now, the
+        // narrower "not full-live capable" assertion is what this fixture
+        // proves.
+        //
+        // Cites Lean theorems in `formal/Shroud/Core/Conformance.lean`:
+        //
+        // - `Shroud.Core.placeholderSource_incompatible_with_fullLive_scope
+        //   (scope : ClaimScope) (h : scope.requiresFullLive = true) :
+        //   sourceAcceptableForScope scope BindingSource.placeholder = false`
+        //   — for every full-live scope, placeholder bindings are rejected.
+        // - `Shroud.Core.plonky3FullFriReplay_fullLive`,
+        //   `Shroud.Core.whirHvzk_fullLive` — the two currently-named full-live
+        //   scopes.
+        // - `Shroud.Core.placeholderSource_acceptable_for_plonky3UniStarkPreGrind`
+        //   — placeholder bindings are admissible for the current Plonky3
+        //   pre-grind scope (not full-live by design).
+        //
+        // The executable evidence: a standard `Plonky3LiveHarnessInput`
+        // contains at least one `TranscriptBindingSource::Placeholder`
+        // binding (specifically `DOMAIN_PLONKY3_OPENED_VALUES`, per the
+        // post-zeta deferred list in `docs/plonky3-bridge-status.md`). By
+        // composition with the Lean theorem above, any claim scope `s` with
+        // `s.requiresFullLive = true` is excluded — including
+        // `plonky3FullFriReplay` and `whirHvzk`. The fixture does NOT
+        // claim which non-full-live scope the input actually carries.
+        //
+        // If this assertion fires, the bridge has moved to full-live
+        // coverage and the claim-scope wiring must be revisited before the
+        // next release.
+        let fixture = standard_fixture();
+        let security_level = fixture.batch_spec.security_level();
+        let extraction = LivePreGrindExtraction {
+            log_ext_degree: vec![0x01; 4],
+            log_degree: vec![0x02; 4],
+            preprocessed_width: vec![0x03; 4],
+            trace_commit: vec![0x04; 32],
+            preprocessed_commit: None,
+            air_public_values: vec![],
+            quotient_commit: vec![0x08; 32],
+            randomizer_commit: vec![0x09; 32],
+        };
+        let config = Plonky3LiveHarnessConfig {
+            hash_identifier: &fixture.hash_identifier,
+            profile: &fixture.profile,
+            basis: &fixture.basis,
+            batch_spec: &fixture.batch_spec,
+            codeword_spec: &fixture.codeword_spec,
+            oracle_spec: &fixture.oracle_spec,
+            projection_spec: &fixture.projection_spec,
+            quotient_spec: &fixture.quotient_spec,
+            security_level: &security_level,
+            degree_contract: &fixture.degree_contract,
+            public_openings: &fixture.public_openings,
+            opened_values: vec![0x00; 8],
+            fri_commit_phase_commitments: vec![0x01; 8],
+            fri_final_poly: vec![0x02; 8],
+            fri_log_arities: vec![0x03; 8],
+        };
+
+        let input = build_pre_grind_harness_input(&extraction, Vec::new(), &config);
+
+        // At least one Placeholder-sourced binding must be present in a
+        // standard pre-grind input. This is the witness that the scope is
+        // `plonky3UniStarkPreGrind` and not `plonky3FullFriReplay`.
+        let placeholder_count = input
+            .record
+            .absorbed()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| input.record.source_at(*i) == TranscriptBindingSource::Placeholder)
+            .count();
+        assert!(
+            placeholder_count > 0,
+            "current Plonky3 bridge MUST carry placeholder bindings — \
+             this is the structural witness that the input cannot satisfy \
+             any full-live claim scope. By the Lean theorem \
+             placeholderSource_incompatible_with_fullLive_scope in \
+             formal/Shroud/Core/Conformance.lean, both plonky3FullFriReplay \
+             and whirHvzk are excluded. If this fires, the bridge has \
+             unexpectedly moved to full-live coverage."
+        );
+
+        // Sharper: DOMAIN_PLONKY3_OPENED_VALUES must remain a placeholder
+        // until the grind clone-pollution blocker is closed (phase D).
+        let opened_values_index = input
+            .record
+            .absorbed()
+            .iter()
+            .position(|b| b.domain_label() == DOMAIN_PLONKY3_OPENED_VALUES)
+            .expect("DOMAIN_PLONKY3_OPENED_VALUES must appear in the record");
+        assert_eq!(
+            input.record.source_at(opened_values_index),
+            TranscriptBindingSource::Placeholder,
+            "DOMAIN_PLONKY3_OPENED_VALUES must be Placeholder-sourced until \
+             post-zeta engineering (phase D) lands — see \
+             docs/plonky3-bridge-status.md"
+        );
     }
 }

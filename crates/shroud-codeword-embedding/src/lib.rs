@@ -123,6 +123,10 @@ pub struct CodewordEmbeddingPayload {
 
 impl CodewordEmbeddingPayload {
     /// Builds a codeword embedding payload from a validated shape.
+    ///
+    /// Lean theorems: `CodewordEmbeddingPayload.fromShape_committedColumns`,
+    /// `CodewordEmbeddingPayload.fromShape_publicTraceColumns`, and
+    /// `CodewordEmbeddingPayload.fromShape_hiddenRandomizerColumns`.
     #[must_use]
     pub const fn new(
         shape: CodewordEmbeddingShape,
@@ -188,6 +192,10 @@ impl CodewordEmbeddingPayload {
 /// `required_log_blowup >= 2`. A blowup of 1 (the non-hiding default) does
 /// not provide enough evaluation points for the randomizer columns to hide the
 /// trace.
+///
+/// Lean theorems: `ShroudCodewordEmbeddingSpec.valid_implies_randomizerColumns_eq_extensionDegree`,
+/// `ShroudCodewordEmbeddingSpec.valid_implies_requiredLogBlowup_atLeastTwo`,
+/// and `ShroudCodewordEmbeddingSpec.valid_implies_committedColumns_eq_trace_plus_randomizer`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShroudCodewordEmbeddingSpec {
     security_level: SecurityLevel,

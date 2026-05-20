@@ -40,6 +40,8 @@ pub enum QuotientAuxiliaryTransport {
 
 /// Degree compatibility contract for a quotient decomposition.
 ///
+/// Lean mirror: `QuotientDegreeContract` in `formal/Shroud/Core/Degree.lean`.
+///
 /// Carries two distinct degree bounds:
 ///
 /// - **`quotient_chunk_degree`** — the degree of `q_i(X)` before masking; this is the
@@ -79,6 +81,7 @@ impl QuotientDegreeContract {
     ///
     /// Validates `mask_poly_degree ≤ quotient_chunk_degree`. The committed degree
     /// equals the original chunk degree (`randomized_chunk_degree_bound = quotient_chunk_degree`).
+    /// Lean theorem: `QuotientDegreeContract.plain_valid_iff_mask_le_chunk`.
     /// For the vanishing-factor form `q_i(X) + v_{H_i}(X) · t_i(X)`,
     /// use [`Self::with_vanishing_poly`] instead.
     pub fn new(
@@ -107,6 +110,7 @@ impl QuotientDegreeContract {
     /// The required committed degree is `max(quotient_chunk_degree, vanishing_poly_degree +
     /// mask_poly_degree)`. This must not exceed `randomized_chunk_degree_bound`.
     /// When the product exceeds the original chunk degree, the committed degree class expands.
+    /// Lean theorem: `QuotientDegreeContract.vanishing_valid_iff_required_le_bound`.
     /// For plain additive hiding, prefer [`Self::new`].
     pub fn with_vanishing_poly(
         quotient_chunk_degree: usize,
@@ -322,6 +326,11 @@ pub struct QuotientHiderPayload {
 
 impl QuotientHiderPayload {
     /// Builds a quotient-hider payload from a validated shape.
+    ///
+    /// Lean theorems: `QuotientHiderPayload.fromShape_publicCommitments`,
+    /// `QuotientHiderPayload.fromShape_publicOpeningValues`,
+    /// `QuotientHiderPayload.fromShape_hiddenMaskValues`, and
+    /// `QuotientHiderPayload.fromShape_hiddenNormalizationItems`.
     #[must_use]
     pub const fn new(
         shape: QuotientHiderShape,

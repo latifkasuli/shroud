@@ -1,6 +1,11 @@
 use core::fmt;
 
 /// Degree budget for a masked batch-opening relation.
+///
+/// Lean mirror: `formal/Shroud/Core/Degree.lean`.
+/// The key theorem family is `DegreeBudget.valid_iff_randomizer_le_relation_succ`,
+/// `DegreeBudget.maskedRelationDegreeBound_eq`, and
+/// `DegreeBudget.valid_iff_preservesRelationDegree`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DegreeBudget {
     relation_degree: usize,
@@ -32,6 +37,8 @@ impl DegreeBudget {
     }
 
     /// Degree bound of the masked relation after adding `(R(X) - R(zeta)) / (X - zeta)`.
+    ///
+    /// Lean theorem: `DegreeBudget.maskedRelationDegreeBound_eq`.
     pub const fn masked_relation_degree_bound(self) -> usize {
         let randomizer_term_degree = self.randomizer_degree.saturating_sub(1);
         if randomizer_term_degree > self.relation_degree {
@@ -42,6 +49,8 @@ impl DegreeBudget {
     }
 
     /// Returns `true` when the masking term preserves the original relation degree class.
+    ///
+    /// Lean theorem: `DegreeBudget.valid_iff_preservesRelationDegree`.
     pub const fn preserves_relation_degree(self) -> bool {
         self.randomizer_degree <= self.relation_degree.saturating_add(1)
     }

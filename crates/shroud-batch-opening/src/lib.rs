@@ -119,6 +119,10 @@ impl StatisticalRandomizerSpec {
     }
 
     /// Returns the opening payload shape for the statistical randomizer.
+    ///
+    /// Lean theorems: `StatisticalRandomizerSpec.openingPayload_publicExtensionEvaluations`,
+    /// `StatisticalRandomizerSpec.openingPayload_hiddenBaseFieldCoordinateEvaluations`,
+    /// and `StatisticalRandomizerSpec.fromShape_openingPayload_hiddenBaseFieldCoordinateEvaluations`.
     #[must_use]
     pub const fn opening_payload(
         self,
@@ -530,6 +534,10 @@ impl PerfectRandomizerCommitment {
     }
 
     /// Returns the exact opening payload shape for this perfect randomizer.
+    ///
+    /// Lean theorems: `PerfectRandomizerCommitment.encodedOpeningPayload_publicExtensionEvaluations`,
+    /// `PerfectRandomizerCommitment.encodedOpeningPayload_hiddenCoordinates`, and
+    /// `PerfectRandomizerCommitment.nativeOpeningPayload_backendProofOnly`.
     #[must_use]
     pub const fn opening_payload(
         self,
