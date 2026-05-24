@@ -90,6 +90,27 @@ by `sampledPreGrindEvents_are_sampled`.
 
 The Rust conformance fixture `current_plonky3_input_is_not_full_live_capable` in `crates/shroud-conformance/src/lib.rs` provides executable evidence: a standard `Plonky3LiveHarnessInput` carries at least one `TranscriptBindingSource::Placeholder` binding (specifically `DOMAIN_PLONKY3_OPENED_VALUES`). By composition with `placeholderSource_incompatible_with_fullLive_scope`, every full-live scope (`plonky3FullFriReplay`, `whirHvzk`) is excluded. The fixture does NOT also assert the scope is specifically `plonky3UniStarkPreGrind` — that requires a Rust `ClaimScope` enum (Phase C) plus a scoped-claim builder.
 
+**Plonky3-specific scoped claim (Phase B).** `formal/Shroud/Bridge/Plonky3/Claim.lean` connects the abstract Conformance layer to the concrete Plonky3 grammar:
+
+- `plonky3CurrentScope : ClaimScope := plonky3UniStarkPreGrind` names the bridge's accepted scope. Theorems `plonky3CurrentScope_eq`, `plonky3CurrentScope_not_fullLive`, `plonky3CurrentScope_discriminant_eq` (= 1), `plonky3CurrentScope_ne_fullFriReplay`, `plonky3CurrentScope_ne_whirHvzk` fix its identity and rule out masquerading as any full-live scope.
+- `Plonky3PreGrindScopeCovered (shape : PreGrindShape) : Prop` discharges `ShroudChecks.scopeCovered` for this scope by composing `preGrindGrammar_contains_only_liveEventKinds` and `preGrindGrammar_contains_no_postZetaPlaceholders`. `plonky3PreGrindScopeCovered_holds` proves it for every supported AIR shape.
+- `examplePlonky3UniStarkPreGrindClaim` is a worked-example `BackendClaim` for the standard statistical deployment, carrying `plonky3StandardCitations` (BCS-IOP, DEEP-FRI, proximity-gaps, Haböck-Kindi, Aurora, Ligero, RedShift, sponge indifferentiability, Chiesa-Orrù sponge FS). `accept_examplePlonky3Claim_preserves_scope / _securityLevel / _citations` instantiate the Conformance preservation theorems for this concrete claim.
+
+**Rust API alignment (Phase C).** The Rust side mirrors the Lean Conformance vocabulary constructively:
+
+- `shroud_core::ClaimScope` — Rust mirror of `Shroud.Core.ClaimScope`. `#[repr(u32)]` discriminants match `Shroud.Core.ClaimScope.discriminant` exactly. `requires_full_live()` matches `ClaimScope.requiresFullLive`.
+- `shroud_core::UpstreamCitation` — Rust mirror of `Shroud.Core.UpstreamCitation`. Discriminants match `Shroud.Core.UpstreamCitation.discriminant`.
+- `shroud_core::BackendClaim` — Rust mirror of `Shroud.Core.BackendClaim` (security level + scope + citations).
+- `shroud_core::BackendClaimSurface` — trait that backend bridges implement. `backend_claim()` exposes the full typed claim (scope + security level + citations); `claim_scope()` is a default-implemented projection from `backend_claim()`; `verify_independent_checks()` runs the bridge's full local check pipeline.
+
+**Extraction-provenance discipline (Phase C P2 fix).** `BackendClaimSurface` is intentionally **not** implemented on the raw `Plonky3LiveHarnessInput` — a hand-built input with self-consistent (empty, even) `prefix_events` could trivially pass `Plonky3ReplayHarness::verify`. Instead, the trait is implemented on `Plonky3VerifiedLiveInput`, a wrapper with private fields whose only constructor is `verify_pre_grind_bridge_into_verified`. That builder runs the structural extractor, builds the input, and verifies the harness — then stores the resulting extraction + shape inside the wrapper. `verify_independent_checks` re-extracts from the stored prefix events using the stored shape, compares to the stored extraction, and rejects with `PreGrindBridgeError::ExtractionMismatch` on drift. Hand-built inputs with empty events are caught at construction time (extractor refuses empty logs); mutated inputs would be caught by the re-extraction comparison.
+
+The `backend_claim()` returned for the standard Plonky3 deployment is fully populated: `SecurityLevel::Statistical`, `ClaimScope::Plonky3UniStarkPreGrind`, and the 9-entry citation list mirroring `plonky3StandardCitations` from Lean.
+
+The Lean↔Rust correspondence is constructive at the discriminant level — the unit tests `claim_scope_discriminants_match_lean` and `upstream_citation_discriminants_match_lean` in `shroud-core` lock the values, and PR review per `docs/Lean Normative Spec Restructure.md` §8 catches drift when either side is touched.
+
+`ShroudChecks<Scope>` phantom typing in Rust (matching Lean's scope-indexed check bundle) is intentionally deferred — it's harder to express cleanly in Rust without GATs and the trait method signature is sufficient for v1. A machine-checked Lean → JSON → Rust artifact for full automated cross-language drift detection remains a Phase 5 conformance-mechanism upgrade.
+
 ---
 
 ## What is intentionally placeholder

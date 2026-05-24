@@ -5,6 +5,7 @@
 
 mod binding;
 mod claim;
+mod conformance;
 mod degree;
 mod hiding;
 mod surface;
@@ -24,6 +25,7 @@ pub use claim::{
     BasisDescriptor, CoordinateOrder, FieldModel, PerfectClaim, PerfectClaimError, RandomnessModel,
     ReconstructionRule, SimulatorObligations,
 };
+pub use conformance::{BackendClaim, BackendClaimSurface, ClaimScope, UpstreamCitation};
 pub use degree::{DegreeBudget, DegreeBudgetError};
 pub use hiding::HidingTechniqueClaim;
 pub use surface::{AuxiliaryTransport, HiddenAuxiliarySurface, PublicSurface, QueryBudget};

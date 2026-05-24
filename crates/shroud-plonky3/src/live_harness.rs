@@ -41,9 +41,9 @@
 use shroud_batch_opening::ShroudBatchOpeningSpec;
 use shroud_codeword_embedding::ShroudCodewordEmbeddingSpec;
 use shroud_core::{
-    BasisDescriptor, DOMAIN_RANDOMIZER_COMMITMENT, HashIdentifier, PublicOpeningBinding,
-    SecurityLevel, StandardBatchOpeningBindings, TranscriptBindable, TranscriptBinding,
-    TranscriptBindingManifest,
+    BackendClaim, BackendClaimSurface, BasisDescriptor, ClaimScope, DOMAIN_RANDOMIZER_COMMITMENT,
+    HashIdentifier, PublicOpeningBinding, SecurityLevel, StandardBatchOpeningBindings,
+    TranscriptBindable, TranscriptBinding, TranscriptBindingManifest, UpstreamCitation,
 };
 use shroud_opening_projection::ShroudOpeningProjectionSpec;
 use shroud_oracle_commitment::ShroudOracleCommitmentSpec;
@@ -299,6 +299,25 @@ pub fn build_pre_grind_harness_input(
 pub enum PreGrindBridgeError {
     /// The live extractor rejected the recorder events.
     Extraction(LiveExtractionError),
+    /// Re-extraction from the stored prefix events produced a different
+    /// extraction than the bindings were built from. Indicates the input
+    /// was hand-built or mutated after construction; rejects the
+    /// extraction-provenance check on [`Plonky3VerifiedLiveInput`].
+    ExtractionMismatch,
+    /// The `config.security_level` field disagreed with one of the
+    /// protocol-spec security-level methods (`batch_spec.security_level()`,
+    /// `codeword_spec.security_level()`, etc.). The bridge cannot accept a
+    /// claim whose declared security level disagrees with the bound
+    /// specs — that mismatch lets `backend_claim()` report one level while
+    /// the manifest/record bind another.
+    SecurityLevelMismatch {
+        /// The security level declared in `Plonky3LiveHarnessConfig`.
+        config: shroud_core::SecurityLevel,
+        /// The name of the spec whose `security_level()` disagreed.
+        spec: &'static str,
+        /// The spec's declared security level.
+        spec_security_level: shroud_core::SecurityLevel,
+    },
     /// The replay harness rejected the composed bindings.
     Harness(HarnessError),
 }
@@ -307,6 +326,22 @@ impl fmt::Display for PreGrindBridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Extraction(e) => write!(f, "[pre_grind_bridge] {e}"),
+            Self::ExtractionMismatch => write!(
+                f,
+                "[pre_grind_bridge] re-extraction from stored prefix events \
+                 disagrees with the extraction the bindings were built from; \
+                 input was hand-built or mutated"
+            ),
+            Self::SecurityLevelMismatch {
+                config,
+                spec,
+                spec_security_level,
+            } => write!(
+                f,
+                "[pre_grind_bridge] security-level mismatch: config declares \
+                 {config:?} but {spec}.security_level() = {spec_security_level:?}; \
+                 backend_claim() would misreport the bound security level"
+            ),
             Self::Harness(e) => write!(f, "[pre_grind_bridge] {e}"),
         }
     }
@@ -327,25 +362,15 @@ impl From<HarnessError> for PreGrindBridgeError {
 }
 
 /// End-to-end pre-grind bridge verifier — the stable public entry
-/// point for downstream callers.
+/// point for downstream callers that don't need the verified-input
+/// wrapper.
 ///
-/// Given the raw recorder event log from a live `HidingFriPcs`
-/// prove invocation, the deployment's [`LiveExtractorShape`], and a
-/// [`Plonky3LiveHarnessConfig`] carrying the SHROUD protocol-spec
-/// bindings + post-zeta placeholders, this function:
-///
-/// 1. trims the events to the longest replay-clean prefix via
-///    [`longest_byte_equivalent_prefix`] (grind clone-pollution
-///    workaround);
-/// 2. extracts the named SHROUD-stage byte slices via
-///    [`extract_pre_grind_slices`];
-/// 3. composes the harness input via
-///    [`build_pre_grind_harness_input`];
-/// 4. verifies the three [`Plonky3ReplayHarness`] invariants
-///    (provenance → manifest → byte-equivalence replay).
-///
-/// All four steps run fail-fast; the first failing layer determines
-/// the returned [`PreGrindBridgeError`] variant.
+/// This is a thin convenience around [`verify_pre_grind_bridge_into_verified`]:
+/// it runs the same chain (security-level agreement → trim → extract →
+/// build → harness verify) but discards the resulting
+/// [`Plonky3VerifiedLiveInput`] on success. Routing through the verifying
+/// builder ensures both facades inherit the same checks; the two functions
+/// cannot drift apart.
 ///
 /// # Scope
 ///
@@ -369,6 +394,131 @@ pub fn verify_pre_grind_bridge(
     shape: &LiveExtractorShape,
     config: &Plonky3LiveHarnessConfig<'_>,
 ) -> Result<(), PreGrindBridgeError> {
+    verify_pre_grind_bridge_into_verified(events, shape, config).map(|_verified| ())
+}
+
+// ── Verified-live wrapper + BackendClaimSurface impl ────────────────────────
+
+/// Standard upstream citations for the Plonky3 statistical deployment.
+/// Rust mirror of `Shroud.Bridge.Plonky3.plonky3StandardCitations` (defined
+/// in `formal/Shroud/Bridge/Plonky3/Claim.lean`).
+const PLONKY3_STANDARD_CITATIONS: [UpstreamCitation; 9] = [
+    UpstreamCitation::BcsIop,
+    UpstreamCitation::DeepFri,
+    UpstreamCitation::ProximityGaps,
+    UpstreamCitation::HabockKindi,
+    UpstreamCitation::Aurora,
+    UpstreamCitation::Ligero,
+    UpstreamCitation::RedShift,
+    UpstreamCitation::SpongeIndifferentiability,
+    UpstreamCitation::ChiesaOrruSpongeFs,
+];
+
+/// A [`Plonky3LiveHarnessInput`] that has been verified end-to-end against
+/// a live recorder event log — built via [`verify_pre_grind_bridge_into_verified`],
+/// which is the only constructor.
+///
+/// This wrapper carries:
+///
+/// - the [`LivePreGrindExtraction`] and [`LiveExtractorShape`] the input
+///   was built from, so [`verify_independent_checks`](BackendClaimSurface::verify_independent_checks)
+///   can re-extract from `prefix_events` and compare to the stored
+///   extraction (the **extraction-provenance check**);
+/// - the [`SecurityLevel`] that was validated against every protocol spec
+///   at construction time, so `backend_claim()` reports the same security
+///   level the manifest/record bind (preventing the
+///   "claim says X, transcript binds Y" mismatch).
+///
+/// The fields are private. Wrapper construction goes through the verifying
+/// builder, so any `Plonky3VerifiedLiveInput` value is — by type — known to
+/// have passed extraction, security-level agreement, and harness
+/// verification at least once.
+#[derive(Debug)]
+pub struct Plonky3VerifiedLiveInput {
+    input: Plonky3LiveHarnessInput,
+    extraction: LivePreGrindExtraction,
+    shape: LiveExtractorShape,
+    security_level: SecurityLevel,
+}
+
+impl Plonky3VerifiedLiveInput {
+    /// The underlying input.
+    #[must_use]
+    pub fn input(&self) -> &Plonky3LiveHarnessInput {
+        &self.input
+    }
+
+    /// The extraction the bindings were built from.
+    #[must_use]
+    pub fn extraction(&self) -> &LivePreGrindExtraction {
+        &self.extraction
+    }
+
+    /// The extractor shape used to derive the extraction.
+    #[must_use]
+    pub fn shape(&self) -> &LiveExtractorShape {
+        &self.shape
+    }
+
+    /// The validated security level (agreed across config and all specs).
+    #[must_use]
+    pub fn security_level(&self) -> SecurityLevel {
+        self.security_level
+    }
+}
+
+/// Validate that `config.security_level` agrees with every protocol spec's
+/// `security_level()` method. Catches the cross-field inconsistency where a
+/// caller declares one level in the config and another in a spec, which
+/// would let `backend_claim()` misreport the bound security level.
+fn validate_security_level_agreement(
+    config: &Plonky3LiveHarnessConfig<'_>,
+) -> Result<SecurityLevel, PreGrindBridgeError> {
+    let declared = *config.security_level;
+    let pairs: [(&'static str, SecurityLevel); 5] = [
+        ("batch_spec", config.batch_spec.security_level()),
+        ("codeword_spec", config.codeword_spec.security_level()),
+        ("oracle_spec", config.oracle_spec.security_level()),
+        ("projection_spec", config.projection_spec.security_level()),
+        ("quotient_spec", config.quotient_spec.security_level()),
+    ];
+    for (spec_name, spec_level) in pairs {
+        if spec_level != declared {
+            return Err(PreGrindBridgeError::SecurityLevelMismatch {
+                config: declared,
+                spec: spec_name,
+                spec_security_level: spec_level,
+            });
+        }
+    }
+    Ok(declared)
+}
+
+/// Verifying builder for [`Plonky3VerifiedLiveInput`]. Runs the same chain
+/// as [`verify_pre_grind_bridge`] (trim → extract → build → harness verify),
+/// and additionally:
+///
+/// 1. Validates that `config.security_level` agrees with every protocol
+///    spec's `security_level()` method (rejects with
+///    [`PreGrindBridgeError::SecurityLevelMismatch`] on drift).
+/// 2. Returns the wrapped input + extraction + shape + validated security
+///    level on success, so [`BackendClaimSurface::verify_independent_checks`]
+///    can re-validate extraction provenance and [`BackendClaim::backend_claim`]
+///    reports the agreed security level.
+///
+/// This is the **only** constructor for [`Plonky3VerifiedLiveInput`]. Any
+/// instance of that type therefore has — by type — passed extraction,
+/// security-level agreement, and harness verification at construction
+/// time.
+pub fn verify_pre_grind_bridge_into_verified(
+    events: &[ByteTranscriptEvent],
+    shape: &LiveExtractorShape,
+    config: &Plonky3LiveHarnessConfig<'_>,
+) -> Result<Plonky3VerifiedLiveInput, PreGrindBridgeError> {
+    // 1. Security-level agreement check — must precede any byte work so
+    //    that an inconsistent config is rejected before extraction effort.
+    let security_level = validate_security_level_agreement(config)?;
+
     let longest = longest_byte_equivalent_prefix(events);
     let prefix_events: Vec<ByteTranscriptEvent> = events[..longest].to_vec();
 
@@ -383,7 +533,71 @@ pub fn verify_pre_grind_bridge(
     )
     .verify()?;
 
-    Ok(())
+    Ok(Plonky3VerifiedLiveInput {
+        input,
+        extraction,
+        shape: shape.clone(),
+        security_level,
+    })
+}
+
+/// [`BackendClaimSurface`] implementation for the verified Plonky3 pre-grind
+/// bridge wrapper.
+///
+/// - `backend_claim()` returns a fully-populated [`BackendClaim`]: statistical
+///   security level, `Plonky3UniStarkPreGrind` scope, and the standard
+///   citation list mirrored from `plonky3StandardCitations` in Lean.
+/// - `verify_independent_checks()` runs the **extraction-provenance check**
+///   (re-extract from `prefix_events` using the stored shape; require the
+///   result to equal the stored extraction) followed by the full
+///   [`Plonky3ReplayHarness`] pipeline (provenance gate, manifest exactness,
+///   byte-equivalence replay).
+///
+/// The extraction-provenance check is what makes this implementation
+/// stronger than the bare facade: a hand-rolled `Plonky3LiveHarnessInput`
+/// with empty `prefix_events` cannot be wrapped in a
+/// [`Plonky3VerifiedLiveInput`] (the only constructor runs verification at
+/// build time), and even if one were constructed by other means, the
+/// re-extraction here would reject it.
+impl BackendClaimSurface for Plonky3VerifiedLiveInput {
+    type Error = PreGrindBridgeError;
+
+    fn backend_claim(&self) -> BackendClaim {
+        // The security level is the validated-consistent value from the
+        // verifying builder — `verify_pre_grind_bridge_into_verified`
+        // confirmed it matches every protocol spec's `security_level()`
+        // before this wrapper was constructed. Reporting it here ensures
+        // `backend_claim()` agrees with what the manifest/record bind.
+        BackendClaim::new(
+            self.security_level,
+            ClaimScope::Plonky3UniStarkPreGrind,
+            PLONKY3_STANDARD_CITATIONS.to_vec(),
+        )
+    }
+
+    fn verify_independent_checks(&self) -> Result<(), Self::Error> {
+        // Extraction-provenance check: re-derive the extraction from the
+        // stored prefix events using the stored shape, and require it to
+        // equal the extraction the bindings were built from. Catches
+        // mutation of prefix_events after construction, mismatched
+        // shape/extraction pairs, and hand-built inputs that bypassed the
+        // verifying builder.
+        let re_extraction = extract_pre_grind_slices(&self.input.prefix_events, &self.shape)?;
+        if re_extraction != self.extraction {
+            return Err(PreGrindBridgeError::ExtractionMismatch);
+        }
+
+        // Harness invariants.
+        Plonky3ReplayHarness::new(
+            &self.input.profile,
+            &self.input.record,
+            &self.input.manifest,
+            &self.input.prefix_events,
+        )
+        .verify()?;
+
+        Ok(())
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

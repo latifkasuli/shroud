@@ -17,13 +17,14 @@ mod tests {
     };
     use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
     use shroud_core::{
-        BasisDescriptor, DOMAIN_BASIS, DOMAIN_BATCH_OPENING, DOMAIN_CODEWORD_EMBEDDING,
-        DOMAIN_DEGREE_CONTRACT, DOMAIN_HASH_ID, DOMAIN_OPENING_PROJECTION,
-        DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE, DOMAIN_PUBLIC_OPENINGS, DOMAIN_QUOTIENT_HIDER,
-        DOMAIN_RANDOMIZER_COMMITMENT, DOMAIN_SECURITY_LEVEL, FieldModel, HashIdentifier,
-        PerfectClaim, PublicOpeningBinding, RandomnessModel, SecurityLevel, SimulatorObligations,
-        StandardBatchOpeningBindings, TranscriptBindable, TranscriptBinding,
-        TranscriptBindingManifest, TranscriptBindingSource, TranscriptStage,
+        BackendClaim, BasisDescriptor, ClaimScope, DOMAIN_BASIS, DOMAIN_BATCH_OPENING,
+        DOMAIN_CODEWORD_EMBEDDING, DOMAIN_DEGREE_CONTRACT, DOMAIN_HASH_ID,
+        DOMAIN_OPENING_PROJECTION, DOMAIN_ORACLE_COMMITMENT, DOMAIN_PROFILE,
+        DOMAIN_PUBLIC_OPENINGS, DOMAIN_QUOTIENT_HIDER, DOMAIN_RANDOMIZER_COMMITMENT,
+        DOMAIN_SECURITY_LEVEL, FieldModel, HashIdentifier, PerfectClaim, PublicOpeningBinding,
+        RandomnessModel, SecurityLevel, SimulatorObligations, StandardBatchOpeningBindings,
+        TranscriptBindable, TranscriptBinding, TranscriptBindingManifest, TranscriptBindingSource,
+        TranscriptStage, UpstreamCitation,
     };
     use shroud_opening_projection::{
         AuxiliaryOpeningTransport, OpeningProjectionShape, ShroudOpeningProjectionSpec,
@@ -38,7 +39,8 @@ mod tests {
         DOMAIN_PLONKY3_OPENED_VALUES, DOMAIN_PLONKY3_PREPROCESSED_COMMITMENT,
         DOMAIN_PLONKY3_PREPROCESSED_WIDTH, DOMAIN_PLONKY3_QUOTIENT_COMMITMENT,
         DOMAIN_PLONKY3_TRACE_COMMITMENT, LiveExtractorShape, LivePreGrindExtraction,
-        Plonky3LiveHarnessConfig, build_pre_grind_harness_input, extract_pre_grind_slices,
+        Plonky3LiveHarnessConfig, PreGrindBridgeError, build_pre_grind_harness_input,
+        extract_pre_grind_slices, verify_pre_grind_bridge, verify_pre_grind_bridge_into_verified,
     };
     use shroud_quotient_hider::{
         QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
@@ -705,5 +707,294 @@ mod tests {
              post-zeta engineering (phase D) lands — see \
              docs/plonky3-bridge-status.md"
         );
+
+        // (Phase C P2 follow-up note.) `Plonky3LiveHarnessInput` itself no
+        // longer implements `BackendClaimSurface` — that impl was moved to
+        // `Plonky3VerifiedLiveInput`, which carries extraction-provenance
+        // and re-extracts during verification. See
+        // `verified_wrapper_rejects_hand_built_input_with_empty_events`
+        // below for the regression that motivates this split.
+    }
+
+    /// Rust mirror of `Shroud.Bridge.Plonky3.plonky3StandardCitations` as a
+    /// typed `UpstreamCitation` list. Phase C replaces the previous string
+    /// mirror with the actual `shroud-core` enum; the Lean → Rust
+    /// correspondence is now constructive at the discriminant level
+    /// (verified by `claim_scope_discriminants_match_lean` and
+    /// `upstream_citation_discriminants_match_lean` in `shroud-core`).
+    /// Drift between Lean and Rust is still caught by PR review per
+    /// `docs/Lean Normative Spec Restructure.md` §8.
+    const PLONKY3_STANDARD_CITATIONS: &[UpstreamCitation] = &[
+        UpstreamCitation::BcsIop,
+        UpstreamCitation::DeepFri,
+        UpstreamCitation::ProximityGaps,
+        UpstreamCitation::HabockKindi,
+        UpstreamCitation::Aurora,
+        UpstreamCitation::Ligero,
+        UpstreamCitation::RedShift,
+        UpstreamCitation::SpongeIndifferentiability,
+        UpstreamCitation::ChiesaOrruSpongeFs,
+    ];
+
+    #[test]
+    fn plonky3_current_scope_is_typed_to_pre_grind() {
+        // Phase C conformance: with the Rust `ClaimScope` enum in place,
+        // we can construct an actual `BackendClaim` whose scope is the
+        // typed `Plonky3UniStarkPreGrind` variant. This closes the
+        // Phase A P2-2 overclaim entirely — the scope identity now lives
+        // in the type system, not in a docstring.
+        //
+        // Mirrors `Shroud.Bridge.Plonky3.plonky3CurrentScope = .plonky3UniStarkPreGrind`
+        // (proven by `plonky3CurrentScope_eq` in
+        // `formal/Shroud/Bridge/Plonky3/Claim.lean`).
+        let claim = BackendClaim::new(
+            SecurityLevel::Statistical,
+            ClaimScope::Plonky3UniStarkPreGrind,
+            PLONKY3_STANDARD_CITATIONS.to_vec(),
+        );
+        assert_eq!(claim.scope, ClaimScope::Plonky3UniStarkPreGrind);
+        assert_eq!(claim.scope.discriminant(), 1);
+        assert!(!claim.requires_full_live());
+        assert_eq!(claim.security_level, SecurityLevel::Statistical);
+        assert_eq!(claim.citations.len(), 9);
+    }
+
+    #[test]
+    fn plonky3_current_scope_distinct_from_other_scopes() {
+        // Phase C conformance: mirrors
+        // `Shroud.Bridge.Plonky3.plonky3CurrentScope_ne_fullFriReplay` and
+        // `_ne_whirHvzk`. With the typed enum, scope distinction becomes a
+        // structural property.
+        assert_ne!(
+            ClaimScope::Plonky3UniStarkPreGrind,
+            ClaimScope::Plonky3FullFriReplay
+        );
+        assert_ne!(ClaimScope::Plonky3UniStarkPreGrind, ClaimScope::WhirHvzk);
+        assert_ne!(
+            ClaimScope::Plonky3UniStarkPreGrind,
+            ClaimScope::CoreBatchOpening
+        );
+
+        // All four scopes have distinct discriminants
+        // (matches `Shroud.Core.ClaimScope.discriminants_distinct`).
+        let mut discriminants = [
+            ClaimScope::CoreBatchOpening.discriminant(),
+            ClaimScope::Plonky3UniStarkPreGrind.discriminant(),
+            ClaimScope::Plonky3FullFriReplay.discriminant(),
+            ClaimScope::WhirHvzk.discriminant(),
+        ];
+        discriminants.sort_unstable();
+        assert_eq!(discriminants, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn verifying_builder_rejects_empty_events_at_construction() {
+        // P2 regression for the previous-cycle finding: the
+        // `BackendClaimSurface` impl used to live on `Plonky3LiveHarnessInput`
+        // directly, so a hand-built input with empty `prefix_events` could
+        // pass `verify_independent_checks` — `Plonky3ReplayHarness::verify`
+        // over an empty event log is trivially satisfiable. The fix:
+        //
+        // - The trait impl was moved to `Plonky3VerifiedLiveInput`.
+        // - `Plonky3VerifiedLiveInput` has private fields and only one
+        //   constructor (`verify_pre_grind_bridge_into_verified`), which
+        //   runs `extract_pre_grind_slices` first and refuses empty events.
+        //
+        // This test locks the construction-time rejection: with `&[]` as
+        // the event log, the verifying builder returns
+        // `PreGrindBridgeError::Extraction(LiveExtractionError::TruncatedLog
+        // { reading: "log_ext_degree", .. })`. The trait surface is
+        // therefore unreachable for empty-event inputs.
+        let fixture = standard_fixture();
+        let security_level = fixture.batch_spec.security_level();
+        let config = Plonky3LiveHarnessConfig {
+            hash_identifier: &fixture.hash_identifier,
+            profile: &fixture.profile,
+            basis: &fixture.basis,
+            batch_spec: &fixture.batch_spec,
+            codeword_spec: &fixture.codeword_spec,
+            oracle_spec: &fixture.oracle_spec,
+            projection_spec: &fixture.projection_spec,
+            quotient_spec: &fixture.quotient_spec,
+            security_level: &security_level,
+            degree_contract: &fixture.degree_contract,
+            public_openings: &fixture.public_openings,
+            opened_values: vec![0x00; 8],
+            fri_commit_phase_commitments: vec![0x01; 8],
+            fri_final_poly: vec![0x02; 8],
+            fri_log_arities: vec![0x03; 8],
+        };
+
+        let err =
+            verify_pre_grind_bridge_into_verified(&[], &LiveExtractorShape::standard(), &config)
+                .expect_err("verifying builder must reject empty events");
+        assert!(
+            matches!(err, PreGrindBridgeError::Extraction(_)),
+            "expected PreGrindBridgeError::Extraction for empty events, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verifying_builder_rejects_security_level_mismatch() {
+        // P2 regression for the previous-cycle finding: the original Phase
+        // C `backend_claim()` hardcoded `SecurityLevel::Statistical`, while
+        // the verifying builder accepted any `config.security_level` and
+        // bound that value into the manifest/record. A caller could build
+        // a verified input whose transcript binding said `Perfect` while
+        // `backend_claim()` reported `Statistical`. The harness would
+        // accept (manifest/record were self-consistent), and the
+        // claim/transcript disagreement would silently slip through.
+        //
+        // The fix has two parts:
+        //
+        // 1. `verify_pre_grind_bridge_into_verified` now validates that
+        //    `config.security_level` agrees with every protocol spec's
+        //    `security_level()` method before any byte work. Mismatches
+        //    return `PreGrindBridgeError::SecurityLevelMismatch`.
+        // 2. The validated level is stored on `Plonky3VerifiedLiveInput`
+        //    and reported by `backend_claim()`, so `backend_claim()` and
+        //    the bound transcript always agree.
+        //
+        // This regression locks the validation: a config that declares
+        // `Perfect` against the standard statistical specs is rejected
+        // before extraction is attempted. The Plonky3 backend has no
+        // `Perfect` deployment today (all five specs above are constructed
+        // via `*::statistical(...)`), so the inconsistency is purely a
+        // declared-versus-bound mismatch — exactly the failure mode the
+        // P2 finding identified.
+        let fixture = standard_fixture();
+        // Force a security-level mismatch by declaring `Perfect` while
+        // the specs in `fixture` are all `Statistical`.
+        let mismatched_level = SecurityLevel::Perfect;
+        assert_eq!(
+            fixture.batch_spec.security_level(),
+            SecurityLevel::Statistical
+        );
+
+        let config = Plonky3LiveHarnessConfig {
+            hash_identifier: &fixture.hash_identifier,
+            profile: &fixture.profile,
+            basis: &fixture.basis,
+            batch_spec: &fixture.batch_spec,
+            codeword_spec: &fixture.codeword_spec,
+            oracle_spec: &fixture.oracle_spec,
+            projection_spec: &fixture.projection_spec,
+            quotient_spec: &fixture.quotient_spec,
+            security_level: &mismatched_level,
+            degree_contract: &fixture.degree_contract,
+            public_openings: &fixture.public_openings,
+            opened_values: vec![0x00; 8],
+            fri_commit_phase_commitments: vec![0x01; 8],
+            fri_final_poly: vec![0x02; 8],
+            fri_log_arities: vec![0x03; 8],
+        };
+
+        // Pass an empty event log — the builder should reject on the
+        // security-level check BEFORE reaching extraction. (If extraction
+        // ran first, we'd get an `Extraction` error instead.)
+        let err =
+            verify_pre_grind_bridge_into_verified(&[], &LiveExtractorShape::standard(), &config)
+                .expect_err("verifying builder must reject security-level mismatch");
+
+        match err {
+            PreGrindBridgeError::SecurityLevelMismatch {
+                config,
+                spec,
+                spec_security_level,
+            } => {
+                assert_eq!(config, SecurityLevel::Perfect);
+                assert_eq!(spec_security_level, SecurityLevel::Statistical);
+                // First spec checked is batch_spec — the validation order
+                // is fixed in `validate_security_level_agreement`.
+                assert_eq!(spec, "batch_spec");
+            }
+            other => panic!("expected SecurityLevelMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn facade_rejects_security_level_mismatch() {
+        // P2 regression for the previous-cycle finding: the older
+        // `verify_pre_grind_bridge` facade bypassed
+        // `validate_security_level_agreement` and could accept a config
+        // with `config.security_level` disagreeing with the bound specs.
+        // Phase C P2 second iteration: `verify_pre_grind_bridge` now
+        // delegates to `verify_pre_grind_bridge_into_verified(...).map(|_|
+        // ())`, so both facades inherit the same security-level check
+        // and cannot drift apart.
+        //
+        // This regression mirrors
+        // `verifying_builder_rejects_security_level_mismatch` (which
+        // exercised the wrapper-returning facade) but on the
+        // unit-returning facade. If `verify_pre_grind_bridge` stops
+        // delegating to the verifying builder, this fixture fails.
+        let fixture = standard_fixture();
+        let mismatched_level = SecurityLevel::Perfect;
+        assert_eq!(
+            fixture.batch_spec.security_level(),
+            SecurityLevel::Statistical
+        );
+
+        let config = Plonky3LiveHarnessConfig {
+            hash_identifier: &fixture.hash_identifier,
+            profile: &fixture.profile,
+            basis: &fixture.basis,
+            batch_spec: &fixture.batch_spec,
+            codeword_spec: &fixture.codeword_spec,
+            oracle_spec: &fixture.oracle_spec,
+            projection_spec: &fixture.projection_spec,
+            quotient_spec: &fixture.quotient_spec,
+            security_level: &mismatched_level,
+            degree_contract: &fixture.degree_contract,
+            public_openings: &fixture.public_openings,
+            opened_values: vec![0x00; 8],
+            fri_commit_phase_commitments: vec![0x01; 8],
+            fri_final_poly: vec![0x02; 8],
+            fri_log_arities: vec![0x03; 8],
+        };
+
+        let err = verify_pre_grind_bridge(&[], &LiveExtractorShape::standard(), &config)
+            .expect_err("verify_pre_grind_bridge must reject security-level mismatch");
+        match err {
+            PreGrindBridgeError::SecurityLevelMismatch {
+                config,
+                spec,
+                spec_security_level,
+            } => {
+                assert_eq!(config, SecurityLevel::Perfect);
+                assert_eq!(spec_security_level, SecurityLevel::Statistical);
+                assert_eq!(spec, "batch_spec");
+            }
+            other => panic!("expected SecurityLevelMismatch from facade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plonky3_standard_citations_typed_set_mirror() {
+        // Phase C conformance: typed-enum version of the previous
+        // string-list mirror. Lean's `plonky3StandardCitations` is the
+        // source of truth; this constant must match as a set (order is
+        // not significant). Adding/removing/renaming a citation in either
+        // Lean or Rust requires updating both sides in the same PR.
+        let mut actual: Vec<u32> = PLONKY3_STANDARD_CITATIONS
+            .iter()
+            .map(|c| c.discriminant())
+            .collect();
+        actual.sort_unstable();
+        let expected: Vec<u32> = vec![
+            UpstreamCitation::BcsIop.discriminant(),
+            UpstreamCitation::DeepFri.discriminant(),
+            UpstreamCitation::ProximityGaps.discriminant(),
+            UpstreamCitation::HabockKindi.discriminant(),
+            UpstreamCitation::Aurora.discriminant(),
+            UpstreamCitation::Ligero.discriminant(),
+            UpstreamCitation::RedShift.discriminant(),
+            UpstreamCitation::SpongeIndifferentiability.discriminant(),
+            UpstreamCitation::ChiesaOrruSpongeFs.discriminant(),
+        ];
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort_unstable();
+        assert_eq!(actual, expected_sorted);
+        assert_eq!(actual.len(), 9);
     }
 }

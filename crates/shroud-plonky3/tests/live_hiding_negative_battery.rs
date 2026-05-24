@@ -47,8 +47,8 @@ use rand::rngs::SmallRng;
 use shroud_batch_opening::{BatchOpeningShape, ShroudBatchOpeningSpec};
 use shroud_codeword_embedding::{CodewordEmbeddingShape, ShroudCodewordEmbeddingSpec};
 use shroud_core::{
-    BasisDescriptor, DOMAIN_HASH_ID, DOMAIN_RANDOMIZER_COMMITMENT, HashIdentifier,
-    PublicOpeningBinding, SecurityLevel, TranscriptBindable, TranscriptBinding,
+    BackendClaimSurface, BasisDescriptor, ClaimScope, DOMAIN_HASH_ID, DOMAIN_RANDOMIZER_COMMITMENT,
+    HashIdentifier, PublicOpeningBinding, SecurityLevel, TranscriptBindable, TranscriptBinding,
     TranscriptBindingError,
 };
 use shroud_opening_projection::{
@@ -63,7 +63,7 @@ use shroud_plonky3::{
     LiveExtractorShape, Plonky3HashIdentifier, Plonky3LiveHarnessConfig, Plonky3LiveHarnessInput,
     Plonky3ReplayHarness, RecordingByteChallenger, build_pre_grind_harness_input,
     extract_pre_grind_slices, longest_byte_equivalent_prefix, new_pinned_recording_challenger,
-    verify_pre_grind_bridge,
+    verify_pre_grind_bridge, verify_pre_grind_bridge_into_verified,
 };
 use shroud_quotient_hider::{
     QuotientAuxiliaryTransport, QuotientDecompositionFamily, QuotientDegreeContract,
@@ -366,6 +366,95 @@ fn live_facade_verifies_well_formed_proof_end_to_end() {
 
     verify_pre_grind_bridge(&events, &LiveExtractorShape::standard(), &config)
         .expect("facade must verify a well-formed live proof end-to-end");
+}
+
+/// **Verifying-builder positive path.** [`verify_pre_grind_bridge_into_verified`]
+/// returns a [`Plonky3VerifiedLiveInput`] on success; the wrapper carries
+/// extraction provenance and exposes [`BackendClaimSurface`]. This test
+/// proves the full Phase C P2 fix: on a well-formed proof, the verifying
+/// builder produces a wrapper whose `backend_claim()` matches the Lean
+/// `examplePlonky3UniStarkPreGrindClaim` (scope, security level, citations),
+/// and whose `verify_independent_checks` (which re-extracts from the stored
+/// prefix events) passes.
+#[test]
+fn verified_wrapper_exposes_backend_claim_and_passes_independent_checks() {
+    let (recording_config, recorder) = make_recording_hiding_config();
+    let trace = generate_square_trace::<Val>(1 << 3);
+    let _proof = prove(&recording_config, &SquareAir, trace, &[]);
+    let events = recorder.events();
+
+    let hash_identifier = Plonky3HashIdentifier::standard().to_hash_identifier();
+    let profile = shroud_reference::ReferenceHidingFriPcsProfile::standard();
+    let basis = BasisDescriptor::plonky3_binomial(4);
+    let batch_spec =
+        ShroudBatchOpeningSpec::statistical(BatchOpeningShape::new(4, 1, 2).expect("valid"), 15)
+            .expect("valid");
+    let codeword_spec = ShroudCodewordEmbeddingSpec::statistical(
+        CodewordEmbeddingShape::new(64, 4, 18, 4).expect("valid"),
+    )
+    .expect("valid");
+    let oracle_spec = ShroudOracleCommitmentSpec::statistical(
+        OracleCommitmentShape::new(2, 3, 4, 5, 1).expect("valid"),
+        OracleAuxiliaryTransport::InBandWithOpeningProof,
+    )
+    .expect("valid");
+    let projection_spec = ShroudOpeningProjectionSpec::statistical(
+        OpeningProjectionShape::new(3, 5, 2).expect("valid"),
+        AuxiliaryOpeningTransport::InBandWithMainProof,
+    )
+    .expect("valid");
+    let degree_contract = QuotientDegreeContract::with_vanishing_poly(7, 8, 7, 15).expect("valid");
+    let quotient_spec = ShroudQuotientHiderSpec::statistical(
+        QuotientDecompositionFamily::DegreeChunked,
+        8,
+        QuotientHiderShape::new(3, 2, 4, 1, 2).expect("valid"),
+        QuotientAuxiliaryTransport::InBandWithOpeningProof,
+        Some(degree_contract),
+    )
+    .expect("valid");
+    let security_level = SecurityLevel::Statistical;
+    let public_openings = PublicOpeningBinding::new(vec![0xCD; 8]);
+
+    let config = Plonky3LiveHarnessConfig {
+        hash_identifier: &hash_identifier,
+        profile: &profile,
+        basis: &basis,
+        batch_spec: &batch_spec,
+        codeword_spec: &codeword_spec,
+        oracle_spec: &oracle_spec,
+        projection_spec: &projection_spec,
+        quotient_spec: &quotient_spec,
+        security_level: &security_level,
+        degree_contract: &degree_contract,
+        public_openings: &public_openings,
+        opened_values: vec![0x00; 8],
+        fri_commit_phase_commitments: vec![0x01; 8],
+        fri_final_poly: vec![0x02; 8],
+        fri_log_arities: vec![0x03; 8],
+    };
+
+    let verified =
+        verify_pre_grind_bridge_into_verified(&events, &LiveExtractorShape::standard(), &config)
+            .expect("verifying builder must succeed for a well-formed live proof");
+
+    // BackendClaim exposes the full typed claim — scope + security level +
+    // citations. Mirrors `examplePlonky3UniStarkPreGrindClaim` in Lean.
+    let claim = verified.backend_claim();
+    assert_eq!(claim.scope, ClaimScope::Plonky3UniStarkPreGrind);
+    assert_eq!(claim.security_level, SecurityLevel::Statistical);
+    assert_eq!(claim.citations.len(), 9);
+    assert!(!claim.requires_full_live());
+
+    // `verify_independent_checks` re-extracts from stored prefix events and
+    // compares to the stored extraction (the P2 fix), then runs the
+    // harness. Both must pass on a well-formed input.
+    verified
+        .verify_independent_checks()
+        .expect("independent checks must pass on a well-formed verified wrapper");
+
+    // Default `claim_scope()` impl on the trait projects from
+    // `backend_claim()`; assert it agrees.
+    assert_eq!(verified.claim_scope(), ClaimScope::Plonky3UniStarkPreGrind);
 }
 
 // ── Negative battery ─────────────────────────────────────────────────────────

@@ -165,6 +165,42 @@ inductive UpstreamCitation where
   | chiesaOrruSpongeFs
   deriving BEq, DecidableEq, Repr
 
+namespace UpstreamCitation
+
+/-- Stable cross-language discriminant for upstream citations. Mirrored by the
+Rust `UpstreamCitation` enum's `#[repr(u32)]` discriminants in
+`shroud-core`. -/
+def discriminant : UpstreamCitation → Nat
+  | bcsIop => 0
+  | deepFri => 1
+  | proximityGaps => 2
+  | hvzkWhir => 3
+  | habockKindi => 4
+  | aurora => 5
+  | ligero => 6
+  | redshift => 7
+  | spongeIndifferentiability => 8
+  | fiatShamirRom => 9
+  | chiesaOrruSpongeFs => 10
+
+end UpstreamCitation
+
+/-- All eleven upstream citations have distinct discriminants. -/
+theorem upstreamCitation_discriminants_distinct :
+    [ (UpstreamCitation.bcsIop.discriminant)
+    , (UpstreamCitation.deepFri.discriminant)
+    , (UpstreamCitation.proximityGaps.discriminant)
+    , (UpstreamCitation.hvzkWhir.discriminant)
+    , (UpstreamCitation.habockKindi.discriminant)
+    , (UpstreamCitation.aurora.discriminant)
+    , (UpstreamCitation.ligero.discriminant)
+    , (UpstreamCitation.redshift.discriminant)
+    , (UpstreamCitation.spongeIndifferentiability.discriminant)
+    , (UpstreamCitation.fiatShamirRom.discriminant)
+    , (UpstreamCitation.chiesaOrruSpongeFs.discriminant)
+    ].Nodup := by
+  decide
+
 /-! ## Backend claim and SHROUD-side checks -/
 
 /-- A backend's declared scoped claim. SHROUD's job is to accept this claim

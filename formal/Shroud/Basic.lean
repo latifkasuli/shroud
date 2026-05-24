@@ -1,3 +1,4 @@
+import Shroud.Bridge.Plonky3.Claim
 import Shroud.Bridge.Plonky3.PreGrind
 import Shroud.Core.Binding
 import Shroud.Core.Conformance
